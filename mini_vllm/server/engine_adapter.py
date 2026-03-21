@@ -1,6 +1,7 @@
 import asyncio
 import time
 import uuid
+from collections.abc import AsyncIterator
 from pathlib import Path
 from typing import Any
 
@@ -49,7 +50,7 @@ class EngineAdapter:
         )
 
     async def create_completion(self, request: CompletionRequest) -> CompletionResponse:
-        self._validate_request(request.model, request.stream, request.n)
+        self._validate_request(request.model, request.n)
         prompts = [request.prompt] if isinstance(request.prompt, str) else request.prompt
         outputs = await self._generate(
             prompts,
@@ -72,8 +73,39 @@ class EngineAdapter:
             usage=usage,
         )
 
+    async def stream_completion(self, request: CompletionRequest) -> AsyncIterator[dict[str, Any]]:
+        self._validate_request(request.model, request.n)
+        prompts = [request.prompt] if isinstance(request.prompt, str) else request.prompt
+        outputs = await self._generate(
+            prompts,
+            self._sampling_params(request.temperature, request.max_tokens),
+        )
+        created = int(time.time())
+        completion_id = f"cmpl-{uuid.uuid4().hex}"
+        for i, output in enumerate(outputs):
+            yield {
+                "id": completion_id,
+                "object": "text_completion",
+                "created": created,
+                "model": self.model_name,
+                "choices": [{"index": i, "text": output["text"], "finish_reason": None}],
+            }
+            yield {
+                "id": completion_id,
+                "object": "text_completion",
+                "created": created,
+                "model": self.model_name,
+                "choices": [
+                    {
+                        "index": i,
+                        "text": "",
+                        "finish_reason": self._finish_reason(output["token_ids"], request.max_tokens),
+                    }
+                ],
+            }
+
     async def create_chat_completion(self, request: ChatCompletionRequest) -> ChatCompletionResponse:
-        self._validate_request(request.model, request.stream, request.n)
+        self._validate_request(request.model, request.n)
         prompt = self._build_chat_prompt(request.messages)
         output = (
             await self._generate(
@@ -94,6 +126,46 @@ class EngineAdapter:
             choices=[choice],
             usage=usage,
         )
+
+    async def stream_chat_completion(self, request: ChatCompletionRequest) -> AsyncIterator[dict[str, Any]]:
+        self._validate_request(request.model, request.n)
+        prompt = self._build_chat_prompt(request.messages)
+        output = (
+            await self._generate(
+                [prompt],
+                self._sampling_params(request.temperature, request.max_tokens),
+            )
+        )[0]
+        created = int(time.time())
+        completion_id = f"chatcmpl-{uuid.uuid4().hex}"
+        yield {
+            "id": completion_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": self.model_name,
+            "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
+        }
+        if output["text"]:
+            yield {
+                "id": completion_id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": self.model_name,
+                "choices": [{"index": 0, "delta": {"content": output["text"]}, "finish_reason": None}],
+            }
+        yield {
+            "id": completion_id,
+            "object": "chat.completion.chunk",
+            "created": created,
+            "model": self.model_name,
+            "choices": [
+                {
+                    "index": 0,
+                    "delta": {},
+                    "finish_reason": self._finish_reason(output["token_ids"], request.max_tokens),
+                }
+            ],
+        }
 
     def close(self):
         if hasattr(self.llm, "exit"):
@@ -146,11 +218,9 @@ class EngineAdapter:
     def _finish_reason(token_ids: list[int], max_tokens: int) -> str:
         return "length" if len(token_ids) >= max_tokens else "stop"
 
-    def _validate_request(self, model: str, stream: bool, n: int):
+    def _validate_request(self, model: str, n: int):
         if model != self.model_name:
             raise UnsupportedRequestError(f"Unknown model: {model}")
-        if stream:
-            raise UnsupportedRequestError("stream=true is not supported yet")
         if n != 1:
             raise UnsupportedRequestError("Only n=1 is supported")
 

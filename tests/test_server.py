@@ -1,3 +1,5 @@
+import json
+
 from fastapi.testclient import TestClient
 
 from mini_vllm.server.app import create_app
@@ -40,6 +42,17 @@ class FakeLLM:
 def make_client():
     adapter = EngineAdapter(llm=FakeLLM(), model_name="Qwen3-0.6B")
     return TestClient(create_app(adapter))
+
+
+def _collect_sse_lines(response):
+    lines = []
+    for line in response.iter_lines():
+        if not line:
+            continue
+        if isinstance(line, bytes):
+            line = line.decode("utf-8")
+        lines.append(line)
+    return lines
 
 
 def test_models_endpoint_returns_served_model():
@@ -96,13 +109,39 @@ def test_chat_completions_endpoint_uses_chat_prompt_and_returns_message():
     assert payload["choices"][0]["message"]["content"] == "reply:0"
 
 
-def test_streaming_request_returns_bad_request():
+def test_chat_completions_stream_returns_sse_chunks():
+    client = make_client()
+
+    with client.stream(
+        "POST",
+        "/v1/chat/completions",
+        json={
+            "model": "Qwen3-0.6B",
+            "messages": [{"role": "user", "content": "Hello"}],
+            "stream": True,
+        },
+    ) as response:
+        lines = _collect_sse_lines(response)
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/event-stream")
+    assert lines[-1] == "data: [DONE]"
+    first = json.loads(lines[0][6:])
+    second = json.loads(lines[1][6:])
+    third = json.loads(lines[2][6:])
+    assert first["object"] == "chat.completion.chunk"
+    assert first["choices"][0]["delta"]["role"] == "assistant"
+    assert second["choices"][0]["delta"]["content"] == "reply:0"
+    assert third["choices"][0]["finish_reason"] == "stop"
+
+
+def test_streaming_unknown_model_returns_bad_request():
     client = make_client()
 
     response = client.post(
         "/v1/chat/completions",
         json={
-            "model": "Qwen3-0.6B",
+            "model": "other-model",
             "messages": [{"role": "user", "content": "Hello"}],
             "stream": True,
         },
@@ -110,4 +149,4 @@ def test_streaming_request_returns_bad_request():
 
     assert response.status_code == 400
     payload = response.json()
-    assert payload["detail"]["message"] == "stream=true is not supported yet"
+    assert payload["detail"]["message"] == "Unknown model: other-model"

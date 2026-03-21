@@ -1,8 +1,11 @@
 import argparse
+import json
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import StreamingResponse
 
 from mini_vllm.server.engine_adapter import EngineAdapter, UnsupportedRequestError
 from mini_vllm.server.protocol import (
@@ -36,6 +39,9 @@ def create_app(adapter: EngineAdapter) -> FastAPI:
     @app.post("/v1/completions")
     async def create_completion(payload: CompletionRequest, request: Request):
         try:
+            if payload.stream:
+                request.app.state.adapter._validate_request(payload.model, payload.n)
+                return _sse_response(request.app.state.adapter.stream_completion(payload))
             return await request.app.state.adapter.create_completion(payload)
         except UnsupportedRequestError as exc:
             raise _bad_request(str(exc)) from exc
@@ -43,11 +49,28 @@ def create_app(adapter: EngineAdapter) -> FastAPI:
     @app.post("/v1/chat/completions")
     async def create_chat_completion(payload: ChatCompletionRequest, request: Request):
         try:
+            if payload.stream:
+                request.app.state.adapter._validate_request(payload.model, payload.n)
+                return _sse_response(request.app.state.adapter.stream_chat_completion(payload))
             return await request.app.state.adapter.create_chat_completion(payload)
         except UnsupportedRequestError as exc:
             raise _bad_request(str(exc)) from exc
 
     return app
+
+
+def _sse_response(events: AsyncIterator[dict]) -> StreamingResponse:
+    return StreamingResponse(
+        _encode_sse(events),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+async def _encode_sse(events: AsyncIterator[dict]):
+    async for event in events:
+        yield f"data: {json.dumps(event, ensure_ascii=False)}\n\n".encode("utf-8")
+    yield b"data: [DONE]\n\n"
 
 
 def _bad_request(message: str) -> HTTPException:

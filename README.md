@@ -69,7 +69,17 @@ curl http://127.0.0.1:8000/v1/chat/completions \
     "model": "Qwen3-0.6B",
     "messages": [{"role": "user", "content": "你好"}]
   }'
+
+curl -N http://127.0.0.1:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Qwen3-0.6B",
+    "messages": [{"role": "user", "content": "用一句话自我介绍"}],
+    "stream": true
+  }'
 ```
+
+Current `stream=true` output is OpenAI-compatible SSE, but it is still buffered behind the current synchronous `LLM.generate()` path.
 
 ## Next
 

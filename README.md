@@ -4,6 +4,8 @@
 
 Performance Results:
 
+Benchmark device: NVIDIA GeForce RTX 5090 (Blackwell), running with `torch 2.10.0+cu128`.
+
 | Inference Engine | Output Tokens | Time (s) | Throughput (tokens/s) |
 | --- | ---: | ---: | ---: |
 | vllm | 133,966 | 12.79 | 10473.98 |
@@ -52,6 +54,21 @@ PYTHONPATH=. python benchmarks/bench_decode_jitter.py --model /root/huggingface/
 PYTHONPATH=. python benchmarks/bench_decode_jitter.py --model /root/huggingface/Qwen3-0.6B --engine-name hilda-vllm-fp8 --kv-cache-dtype fp8
 PYTHONPATH=. python benchmarks/bench_decode_heavy.py --model /root/huggingface/Qwen3-0.6B --engine-name hilda-vllm
 PYTHONPATH=. python benchmarks/bench_decode_heavy.py --model /root/huggingface/Qwen3-0.6B --engine-name hilda-vllm-fp8 --kv-cache-dtype fp8
+```
+
+## OpenAI API Server
+
+Run a local OpenAI-compatible server on top of the local model:
+
+```bash
+python -m mini_vllm.server --model /root/huggingface/Qwen3-0.6B --port 8000
+
+curl http://127.0.0.1:8000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "Qwen3-0.6B",
+    "messages": [{"role": "user", "content": "你好"}]
+  }'
 ```
 
 ## Next

@@ -79,9 +79,9 @@ curl -N http://127.0.0.1:8000/v1/chat/completions \
   }'
 ```
 
-Current `stream=true` output is OpenAI-compatible SSE with real step-level incremental chunks. The first chunk still arrives after prompt prefill finishes.
+Current `stream=true` output is OpenAI-compatible SSE with real step-level incremental chunks. The first chunk still arrives after prompt prefill finishes, and each streaming request still holds the engine exclusively.
 
 ## Next
 
-- Speculative Decoding (in progress)
-- OpenAI API Server (in progress)
+- Improve speculative decoding so draft/verify overhead can beat baseline on realistic model pairs.
+- Reduce streaming exclusivity so streamed requests do not monopolize the engine.

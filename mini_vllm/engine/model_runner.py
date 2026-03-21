@@ -7,6 +7,7 @@ from multiprocessing.shared_memory import SharedMemory
 from mini_vllm.config import Config
 from mini_vllm.engine.scheduler import ScheduledSequence
 from mini_vllm.engine.sequence import Sequence
+from mini_vllm.layers.attention import copy_kvcache_fp8
 from mini_vllm.layers.sampler import Sampler
 from mini_vllm.models.qwen3 import Qwen3ForCausalLM
 from mini_vllm.utils.context import get_context, reset_context, set_context
@@ -171,15 +172,22 @@ class ModelRunner:
     def convert_prefill_to_decode_cache(self, seqs: list[Sequence]):
         if not self.use_fp8_kv_cache or not seqs:
             return
-        block_ids = []
+        slot_mapping = []
         for seq in seqs:
-            num_prompt_blocks = (seq.num_prompt_tokens + self.block_size - 1) // self.block_size
-            block_ids.extend(seq.block_table[:num_prompt_blocks])
-        if not block_ids:
+            for position in range(seq.num_prompt_tokens):
+                block_id = seq.block_table[position // self.block_size]
+                slot_mapping.append(block_id * self.block_size + position % self.block_size)
+        if not slot_mapping:
             return
-        block_ids = list(dict.fromkeys(block_ids))
-        for block_id in block_ids:
-            self.decode_kv_cache[:, :, block_id].copy_(self.prefill_kv_cache[:, :, block_id].to(dtype=self.decode_kv_cache.dtype))
+        slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, device='cuda')
+        for layer_id in range(self.prefill_kv_cache.shape[1]):
+            copy_kvcache_fp8(
+                self.prefill_kv_cache[0, layer_id],
+                self.prefill_kv_cache[1, layer_id],
+                self.decode_kv_cache[0, layer_id],
+                self.decode_kv_cache[1, layer_id],
+                slot_mapping,
+            )
 
     def prepare_block_tables(self, seqs: list[Sequence]):
         max_len = max(len(seq.block_table) for seq in seqs)

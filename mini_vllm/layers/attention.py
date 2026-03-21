@@ -11,13 +11,13 @@ from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
 from mini_vllm.utils.context import get_context
 
 
-_HILDA_FP8_DECODE = None
+_HILDA_FP8_KERNELS = None
 
 
-def _load_hilda_fp8_decode():
-    global _HILDA_FP8_DECODE
-    if _HILDA_FP8_DECODE is not None:
-        return _HILDA_FP8_DECODE
+def _load_hilda_fp8_kernels():
+    global _HILDA_FP8_KERNELS
+    if _HILDA_FP8_KERNELS is not None:
+        return _HILDA_FP8_KERNELS
 
     candidates = []
     env_path = os.environ.get("HILDA_KERNEL_TRITON_PATH")
@@ -33,14 +33,27 @@ def _load_hilda_fp8_decode():
             sys.path.insert(0, candidate_str)
         try:
             from kernels.paged_attention_fp8 import hilda_paged_attention_fp8_decode
+            from kernels.store_kvcache_fp8 import hilda_store_kvcache_fp8, hilda_copy_kvcache_fp8
         except ImportError:
             continue
-        _HILDA_FP8_DECODE = hilda_paged_attention_fp8_decode
-        return _HILDA_FP8_DECODE
+        _HILDA_FP8_KERNELS = {
+            "decode": hilda_paged_attention_fp8_decode,
+            "store": hilda_store_kvcache_fp8,
+            "copy": hilda_copy_kvcache_fp8,
+        }
+        return _HILDA_FP8_KERNELS
 
     raise ImportError(
-        "Unable to import hilda FP8 decode kernel. Set HILDA_KERNEL_TRITON_PATH or make /root/hilda-kernel/triton-kernels available."
+        "Unable to import hilda FP8 kernels. Set HILDA_KERNEL_TRITON_PATH or make /root/hilda-kernel/triton-kernels available."
     )
+
+
+def store_kvcache_fp8(key: torch.Tensor, value: torch.Tensor, k_cache: torch.Tensor, v_cache: torch.Tensor, slot_mapping: torch.Tensor):
+    _load_hilda_fp8_kernels()["store"](key, value, k_cache, v_cache, slot_mapping)
+
+
+def copy_kvcache_fp8(src_k_cache: torch.Tensor, src_v_cache: torch.Tensor, dst_k_cache: torch.Tensor, dst_v_cache: torch.Tensor, slot_mapping: torch.Tensor):
+    _load_hilda_fp8_kernels()["copy"](src_k_cache, src_v_cache, dst_k_cache, dst_v_cache, slot_mapping)
 
 
 @triton.jit
@@ -101,7 +114,6 @@ class Attention(nn.Module):
         if self.kv_cache_dtype == "fp8" and self.prefill_k_cache.numel() and self.decode_k_cache.numel():
             if context.is_prefill:
                 store_kvcache(k, v, self.prefill_k_cache, self.prefill_v_cache, context.slot_mapping)
-                store_kvcache(k, v, self.decode_k_cache, self.decode_v_cache, context.slot_mapping)
                 k_cache, v_cache = self.prefill_k_cache, self.prefill_v_cache
                 if context.block_tables is not None:
                     k, v = k_cache, v_cache
@@ -118,9 +130,8 @@ class Attention(nn.Module):
                     block_table=context.block_tables,
                 )
 
-            store_kvcache(k, v, self.prefill_k_cache, self.prefill_v_cache, context.slot_mapping)
-            store_kvcache(k, v, self.decode_k_cache, self.decode_v_cache, context.slot_mapping)
-            return _load_hilda_fp8_decode()(
+            store_kvcache_fp8(k, v, self.decode_k_cache, self.decode_v_cache, context.slot_mapping)
+            return _load_hilda_fp8_kernels()["decode"](
                 q,
                 self.decode_k_cache,
                 self.decode_v_cache,

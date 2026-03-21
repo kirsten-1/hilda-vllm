@@ -60,7 +60,7 @@ class LLMEngine:
             ready_for_decode = [
                 scheduled_seq.seq
                 for scheduled_seq in seqs
-                if scheduled_seq.seq.is_prefill_done and not scheduled_seq.seq.is_finished and not scheduled_seq.seq.decode_cache_ready
+                if not scheduled_seq.is_padding and scheduled_seq.seq.is_prefill_done and not scheduled_seq.seq.is_finished and not scheduled_seq.seq.decode_cache_ready
             ]
             if ready_for_decode:
                 self.model_runner.call("convert_prefill_to_decode_cache", ready_for_decode)
@@ -70,7 +70,7 @@ class LLMEngine:
         # Speculative decoding: after normal decode, run draft+verify
         num_spec_tokens = 0
         if not is_prefill and self.config.spec_decode_model:
-            running_seqs = [scheduled_seq.seq for scheduled_seq in seqs if not scheduled_seq.seq.is_finished]
+            running_seqs = [scheduled_seq.seq for scheduled_seq in seqs if not scheduled_seq.is_padding and not scheduled_seq.seq.is_finished]
             if running_seqs:
                 gamma = self.config.spec_decode_gamma
                 bm = self.scheduler.block_manager
@@ -108,7 +108,9 @@ class LLMEngine:
                             seq.status = SequenceStatus.FINISHED
                             bm.deallocate(seq)
                             if seq in self.scheduler.running:
-                                self.scheduler.running.remove(seq)
+                                self.scheduler.running.discard(seq)
+                                self.scheduler._free_decode_slot(seq)
+                                self.scheduler._maybe_shrink_batch()
                             break
 
                 # Step 5: Trim unused blocks and fix hash state for remaining sequences
@@ -139,9 +141,9 @@ class LLMEngine:
                                 block.hash = -1
                                 block.token_ids = []
 
-        outputs = [(scheduled_seq.seq.seq_id, scheduled_seq.seq.completion_token_ids) for scheduled_seq in seqs if scheduled_seq.seq.is_finished]
-        num_prefill_tokens = sum(scheduled_seq.token_chunk_size for scheduled_seq in seqs) if is_prefill else 0
-        num_decode_tokens = sum(token_id is not None for token_id in token_ids) if is_prefill else len(token_ids)
+        outputs = [(scheduled_seq.seq.seq_id, scheduled_seq.seq.completion_token_ids) for scheduled_seq in seqs if not scheduled_seq.is_padding and scheduled_seq.seq.is_finished]
+        num_prefill_tokens = sum(scheduled_seq.token_chunk_size for scheduled_seq in seqs if not scheduled_seq.is_padding) if is_prefill else 0
+        num_decode_tokens = sum(1 for sseq, tid in zip(seqs, token_ids) if not sseq.is_padding and tid is not None) if is_prefill else sum(1 for sseq in seqs if not sseq.is_padding)
         num_decode_tokens += num_spec_tokens
         return outputs, num_prefill_tokens, num_decode_tokens
 

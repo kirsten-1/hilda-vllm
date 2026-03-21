@@ -28,6 +28,8 @@ class Sequence:
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens
         self.ignore_eos = sampling_params.ignore_eos
+        self.top_k = sampling_params.top_k
+        self.top_p = sampling_params.top_p
         self.decode_cache_ready = False
         self.decode_slot_index = -1
 
@@ -95,13 +97,32 @@ class Sequence:
             self.num_cached_tokens,
             self.num_computed_tokens,
             self.block_table,
+            self.temperature,
+            self.max_tokens,
+            self.ignore_eos,
+            self.top_k,
+            self.top_p,
             self.decode_cache_ready,
             self.decode_slot_index,
             token_state,
         )
 
     def __setstate__(self, state):
-        self.status, self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.num_computed_tokens, self.block_table, self.decode_cache_ready, self.decode_slot_index = state[:-1]
+        (
+            self.status,
+            self.num_tokens,
+            self.num_prompt_tokens,
+            self.num_cached_tokens,
+            self.num_computed_tokens,
+            self.block_table,
+            self.temperature,
+            self.max_tokens,
+            self.ignore_eos,
+            self.top_k,
+            self.top_p,
+            self.decode_cache_ready,
+            self.decode_slot_index,
+        ) = state[:-1]
         if self.status == SequenceStatus.WAITING or self.num_completion_tokens == 0:
             self.token_ids = state[-1]
             self.last_token = self.token_ids[-1]

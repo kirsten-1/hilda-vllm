@@ -245,8 +245,8 @@ class ModelRunner:
             set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
             logits = self.draft_model.compute_logits(self.draft_model(input_ids, positions))
             probs = torch.softmax(logits.float(), dim=-1)
-            temperatures = self.prepare_sample(seqs)
-            draft_token_ids = self.sampler(logits, temperatures).tolist()
+            temperatures, top_ks, top_ps = self.prepare_sample(seqs)
+            draft_token_ids = self.sampler(logits, temperatures, top_ks, top_ps).tolist()
             for i, token_id in enumerate(draft_token_ids):
                 all_draft_tokens[i].append(token_id)
                 all_draft_probs[i].append(probs[i].cpu())
@@ -416,25 +416,53 @@ class ModelRunner:
         set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables)
         return input_ids, positions
 
-    def prepare_decode(self, seqs: list[Sequence]):
-        input_ids = torch.tensor([seq.last_token for seq in seqs], dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
-        context_lens = torch.tensor([len(seq) for seq in seqs], dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+    def prepare_decode(self, scheduled_seqs: list[ScheduledSequence]):
+        bs = len(scheduled_seqs)
+        input_ids_list = [0] * bs
+        context_lens_list = [0] * bs
+        slot_mapping_list = [-1] * bs
+        real_seqs_with_idx = []
+        max_block_table_len = 1
+
+        for i, sseq in enumerate(scheduled_seqs):
+            if sseq.is_padding:
+                continue
+            seq = sseq.seq
+            input_ids_list[i] = seq.last_token
+            context_lens_list[i] = len(seq)
+            slot_mapping_list[i] = seq.block_table[-1] * self.block_size + seq.last_block_num_tokens - 1
+            real_seqs_with_idx.append((i, seq))
+            max_block_table_len = max(max_block_table_len, len(seq.block_table))
+
+        block_tables_list = [[0] * max_block_table_len for _ in range(bs)]
+        for i, seq in real_seqs_with_idx:
+            bt = seq.block_table
+            for j, bid in enumerate(bt):
+                block_tables_list[i][j] = bid
+            for j in range(len(bt), max_block_table_len):
+                block_tables_list[i][j] = -1
+
+        input_ids = torch.tensor(input_ids_list, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        context_lens = torch.tensor(context_lens_list, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         positions = (context_lens - 1).to(dtype=torch.int64)
-        slot_mapping = torch.tensor(
-            [seq.block_table[-1] * self.block_size + seq.last_block_num_tokens - 1 for seq in seqs],
-            dtype=torch.int32,
-            pin_memory=True,
-        ).cuda(non_blocking=True)
-        block_tables = self.prepare_block_tables(seqs)
+        positions.clamp_min_(0)
+        slot_mapping = torch.tensor(slot_mapping_list, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        block_tables = torch.tensor(block_tables_list, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
         return input_ids, positions
 
     def prepare_sample(self, seqs: list[Sequence]):
         temperatures = []
+        top_ks = []
+        top_ps = []
         for seq in seqs:
             temperatures.append(seq.temperature)
+            top_ks.append(seq.top_k)
+            top_ps.append(seq.top_p)
         temperatures = torch.tensor(temperatures, dtype=torch.float32, pin_memory=True).cuda(non_blocking=True)
-        return temperatures
+        top_ks = torch.tensor(top_ks, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
+        top_ps = torch.tensor(top_ps, dtype=torch.float32, pin_memory=True).cuda(non_blocking=True)
+        return temperatures, top_ks, top_ps
 
     @torch.inference_mode()
     def run_model(self, input_ids: torch.Tensor, positions: torch.Tensor, is_prefill: bool):
@@ -467,8 +495,8 @@ class ModelRunner:
                 token_ids = [None] * len(scheduled_seqs)
                 if sample_indices:
                     sample_logits = logits[sample_indices]
-                    temperatures = self.prepare_sample([seqs[i] for i in sample_indices])
-                    sampled_token_ids = self.sampler(sample_logits, temperatures).tolist()
+                    temperatures, top_ks, top_ps = self.prepare_sample([seqs[i] for i in sample_indices])
+                    sampled_token_ids = self.sampler(sample_logits, temperatures, top_ks, top_ps).tolist()
                     for i, token_id in zip(sample_indices, sampled_token_ids):
                         token_ids[i] = token_id
             else:
@@ -477,11 +505,17 @@ class ModelRunner:
             return token_ids
 
         seqs = [scheduled_seq.seq for scheduled_seq in scheduled_seqs]
-        input_ids, positions = self.prepare_decode(seqs)
+        input_ids, positions = self.prepare_decode(scheduled_seqs)
         logits = self.run_model(input_ids, positions, False)
         if self.rank == 0:
-            temperatures = self.prepare_sample(seqs)
-            token_ids = self.sampler(logits, temperatures).tolist()
+            real_indices = [i for i, sseq in enumerate(scheduled_seqs) if not sseq.is_padding]
+            real_seqs = [scheduled_seqs[i].seq for i in real_indices]
+            temperatures, top_ks, top_ps = self.prepare_sample(real_seqs)
+            real_logits = logits[real_indices]
+            sampled = self.sampler(real_logits, temperatures, top_ks, top_ps).tolist()
+            token_ids = [None] * len(scheduled_seqs)
+            for idx, token_id in zip(real_indices, sampled):
+                token_ids[idx] = token_id
         else:
             token_ids = None
         reset_context()

@@ -38,6 +38,8 @@ class CompletionRequest(BaseModel):
     prompt: str | list[str]
     max_tokens: int = 64
     temperature: float = 1.0
+    top_p: float = 1.0
+    top_k: int = -1
     stream: bool = False
     n: int = 1
 
@@ -64,6 +66,8 @@ class ChatCompletionRequest(BaseModel):
     messages: list[ChatMessage]
     max_tokens: int = 64
     temperature: float = 1.0
+    top_p: float = 1.0
+    top_k: int = -1
     stream: bool = False
     n: int = 1
 

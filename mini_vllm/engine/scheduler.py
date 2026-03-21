@@ -1,5 +1,5 @@
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from mini_vllm.config import Config
 from mini_vllm.engine.block_manager import BlockManager
@@ -8,8 +8,13 @@ from mini_vllm.engine.sequence import Sequence, SequenceStatus
 
 @dataclass
 class ScheduledSequence:
-    seq: Sequence
+    seq: Sequence | None  # None = padding slot
     token_chunk_size: int
+    slot_index: int = -1
+
+    @property
+    def is_padding(self):
+        return self.seq is None
 
     @property
     def num_computed_tokens_after(self):
@@ -33,14 +38,42 @@ class Scheduler:
         self.chunked_prefill_tile_size = config.chunked_prefill_tile_size
         self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size)
         self.waiting: deque[Sequence] = deque()
-        self.running: deque[Sequence] = deque()
+        self.running: set[Sequence] = set()
         self.last_step_was_prefill = False
+
+        # Persistent batching slots
+        self.decode_slots: list[Sequence | None] = [None] * self.max_num_seqs
+        self.free_slot_indices: deque[int] = deque(range(self.max_num_seqs))
+        self.persistent_batch_size: int = 0
 
     def is_finished(self):
         return not self.waiting and not self.running
 
     def add(self, seq: Sequence):
         self.waiting.append(seq)
+
+    # --- Slot management ---
+
+    def _assign_decode_slot(self, seq: Sequence):
+        slot_idx = self.free_slot_indices.popleft()
+        self.decode_slots[slot_idx] = seq
+        seq.decode_slot_index = slot_idx
+        if slot_idx + 1 > self.persistent_batch_size:
+            self.persistent_batch_size = slot_idx + 1
+
+    def _free_decode_slot(self, seq: Sequence):
+        slot_idx = seq.decode_slot_index
+        if slot_idx >= 0:
+            self.decode_slots[slot_idx] = None
+            self.free_slot_indices.append(slot_idx)
+            seq.decode_slot_index = -1
+
+    def _maybe_shrink_batch(self):
+        if not self.running:
+            self.persistent_batch_size = 0
+            self.free_slot_indices = deque(range(self.max_num_seqs))
+
+    # --- Chunked prefill helpers ---
 
     def _compute_chunk_limit(self):
         if not self.enable_chunked_prefill:
@@ -65,6 +98,8 @@ class Scheduler:
             return chunk_size
         aligned = (chunk_size // tile_size) * tile_size
         return aligned if aligned > 0 else chunk_size
+
+    # --- Scheduling ---
 
     def _schedule_prefill(self) -> list[ScheduledSequence]:
         scheduled_seqs = []
@@ -95,22 +130,39 @@ class Scheduler:
         return scheduled_seqs
 
     def _schedule_decode(self) -> list[ScheduledSequence]:
+        if self.persistent_batch_size == 0:
+            return []
         scheduled_seqs = []
-        num_seqs = 0
-        while self.running and num_seqs < self.max_num_seqs:
-            seq = self.running.popleft()
-            while not self.block_manager.can_append(seq):
-                if self.running:
-                    self.preempt(self.running.pop())
-                else:
+        for i in range(self.persistent_batch_size):
+            seq = self.decode_slots[i]
+            if seq is None:
+                # Padding slot
+                scheduled_seqs.append(ScheduledSequence(None, 0, slot_index=i))
+                continue
+            # Check block availability
+            if not self.block_manager.can_append(seq):
+                # Try to preempt another seq to free blocks
+                victim = self._find_preempt_victim(exclude=seq)
+                if victim is not None:
+                    self.preempt(victim)
+                if not self.block_manager.can_append(seq):
+                    # Can't allocate for this seq either, preempt it
                     self.preempt(seq)
-                    break
-            else:
-                num_seqs += 1
-                self.block_manager.may_append(seq)
-                scheduled_seqs.append(ScheduledSequence(seq, 1))
-        self.running.extendleft(reversed([scheduled_seq.seq for scheduled_seq in scheduled_seqs]))
+                    scheduled_seqs.append(ScheduledSequence(None, 0, slot_index=i))
+                    continue
+            self.block_manager.may_append(seq)
+            scheduled_seqs.append(ScheduledSequence(seq, 1, slot_index=i))
         return scheduled_seqs
+
+    def _find_preempt_victim(self, exclude: Sequence | None = None) -> Sequence | None:
+        """Find a running seq to preempt (longest first), excluding the given seq."""
+        best = None
+        for seq in self.running:
+            if seq is exclude:
+                continue
+            if best is None or len(seq) > len(best):
+                best = seq
+        return best
 
     def schedule(self) -> tuple[list[ScheduledSequence], bool]:
         decode_pressure = len(self.running) / max(1, self.max_num_seqs)
@@ -139,6 +191,9 @@ class Scheduler:
         seq.status = SequenceStatus.WAITING
         self.block_manager.deallocate(seq)
         seq.num_computed_tokens = 0
+        self.running.discard(seq)
+        self._free_decode_slot(seq)
+        self._maybe_shrink_batch()
         self.waiting.appendleft(seq)
 
     def _append_waiting(self, seq: Sequence):
@@ -148,6 +203,8 @@ class Scheduler:
     def postprocess(self, seqs: list[ScheduledSequence], token_ids: list[int | None], is_prefill: bool):
         if not is_prefill:
             for scheduled_seq, token_id in zip(seqs, token_ids):
+                if scheduled_seq.is_padding:
+                    continue
                 seq = scheduled_seq.seq
                 assert token_id is not None
                 seq.num_computed_tokens += 1
@@ -155,7 +212,9 @@ class Scheduler:
                 if (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens == seq.max_tokens:
                     seq.status = SequenceStatus.FINISHED
                     self.block_manager.deallocate(seq)
-                    self.running.remove(seq)
+                    self.running.discard(seq)
+                    self._free_decode_slot(seq)
+            self._maybe_shrink_batch()
             return
 
         for scheduled_seq, token_id in zip(seqs, token_ids):
@@ -165,7 +224,8 @@ class Scheduler:
             if reached_sequence_end:
                 self.waiting.remove(seq)
                 seq.status = SequenceStatus.RUNNING
-                self.running.append(seq)
+                self._assign_decode_slot(seq)
+                self.running.add(seq)
             else:
                 self._append_waiting(seq)
                 continue
@@ -174,4 +234,6 @@ class Scheduler:
             if (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens == seq.max_tokens:
                 seq.status = SequenceStatus.FINISHED
                 self.block_manager.deallocate(seq)
-                self.running.remove(seq)
+                self.running.discard(seq)
+                self._free_decode_slot(seq)
+                self._maybe_shrink_batch()

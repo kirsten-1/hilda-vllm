@@ -55,7 +55,7 @@ class EngineAdapter:
         prompts = [request.prompt] if isinstance(request.prompt, str) else request.prompt
         outputs = await self._generate(
             prompts,
-            self._sampling_params(request.temperature, request.max_tokens),
+            self._sampling_params(request.temperature, request.max_tokens, request.top_k, request.top_p),
         )
         usage = self._build_usage(prompts, outputs)
         choices = [
@@ -77,7 +77,7 @@ class EngineAdapter:
     async def stream_completion(self, request: CompletionRequest) -> AsyncIterator[dict[str, Any]]:
         self._validate_request(request.model, request.n)
         prompts = [request.prompt] if isinstance(request.prompt, str) else request.prompt
-        sampling_params = self._sampling_params(request.temperature, request.max_tokens)
+        sampling_params = self._sampling_params(request.temperature, request.max_tokens, request.top_k, request.top_p)
         created = int(time.time())
         completion_id = f"cmpl-{uuid.uuid4().hex}"
         states = [self._new_text_state() for _ in prompts]
@@ -113,7 +113,7 @@ class EngineAdapter:
         output = (
             await self._generate(
                 [prompt],
-                self._sampling_params(request.temperature, request.max_tokens),
+                self._sampling_params(request.temperature, request.max_tokens, request.top_k, request.top_p),
             )
         )[0]
         usage = self._build_usage([prompt], [output])
@@ -133,7 +133,7 @@ class EngineAdapter:
     async def stream_chat_completion(self, request: ChatCompletionRequest) -> AsyncIterator[dict[str, Any]]:
         self._validate_request(request.model, request.n)
         prompt = self._build_chat_prompt(request.messages)
-        sampling_params = self._sampling_params(request.temperature, request.max_tokens)
+        sampling_params = self._sampling_params(request.temperature, request.max_tokens, request.top_k, request.top_p)
         created = int(time.time())
         completion_id = f"chatcmpl-{uuid.uuid4().hex}"
         state = self._new_text_state()
@@ -269,7 +269,12 @@ class EngineAdapter:
             raise UnsupportedRequestError("Only n=1 is supported")
 
     @staticmethod
-    def _sampling_params(temperature: float, max_tokens: int) -> SamplingParams:
+    def _sampling_params(temperature: float, max_tokens: int, top_k: int, top_p: float) -> SamplingParams:
         # mini_vllm currently rejects exact zero temperature, but many OpenAI clients send it.
         safe_temperature = max(temperature, 1e-5)
-        return SamplingParams(temperature=safe_temperature, max_tokens=max_tokens)
+        return SamplingParams(
+            temperature=safe_temperature,
+            max_tokens=max_tokens,
+            top_k=top_k,
+            top_p=top_p,
+        )

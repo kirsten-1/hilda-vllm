@@ -32,7 +32,7 @@ def test_sequence_tracks_prompt_and_completion_tokens():
 
 
 def test_prompt_only_sequence_survives_pickle_roundtrip():
-    seq = Sequence([7, 8, 9], SamplingParams(max_tokens=3))
+    seq = Sequence([7, 8, 9], SamplingParams(max_tokens=3, top_k=8, top_p=0.9))
     seq.num_computed_tokens = 2
 
     restored = pickle.loads(pickle.dumps(seq))
@@ -41,6 +41,8 @@ def test_prompt_only_sequence_survives_pickle_roundtrip():
     assert restored.num_prompt_tokens == 3
     assert restored.num_completion_tokens == 0
     assert restored.num_computed_tokens == 2
+    assert restored.top_k == 8
+    assert restored.top_p == 0.9
 
 
 def test_sequence_exposes_prefill_progress():
@@ -50,6 +52,15 @@ def test_sequence_exposes_prefill_progress():
     assert seq.num_prompt_tokens_remaining == 1
     assert seq.num_uncomputed_tokens == 1
     assert seq.is_prefill_done is False
+
+
+def test_sampling_params_validate_top_k_and_top_p():
+    with pytest.raises(AssertionError):
+        SamplingParams(top_k=0)
+    with pytest.raises(AssertionError):
+        SamplingParams(top_p=0.0)
+    with pytest.raises(AssertionError):
+        SamplingParams(top_p=1.1)
 
 
 def test_sampling_params_rejects_zero_temperature():

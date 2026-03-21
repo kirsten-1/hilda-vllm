@@ -67,8 +67,22 @@ class LLMEngine:
                 for seq in ready_for_decode:
                     seq.decode_cache_ready = True
 
+        # Draft model prefill: after target prefill, run draft prefill for newly ready seqs
+        if is_prefill and self.config.spec_decode_model:
+            draft_prefill_seqs = [
+                scheduled_seq.seq
+                for scheduled_seq in seqs
+                if not scheduled_seq.is_padding and scheduled_seq.seq.is_prefill_done and not scheduled_seq.seq.is_finished and not getattr(scheduled_seq.seq, '_draft_prefill_done', False)
+            ]
+            if draft_prefill_seqs:
+                self.model_runner.call("run_draft_prefill", draft_prefill_seqs)
+                for seq in draft_prefill_seqs:
+                    seq._draft_prefill_done = True
+
         # Speculative decoding: after normal decode, run draft+verify
         num_spec_tokens = 0
+        num_spec_proposed = 0
+        num_spec_accepted = 0
         if not is_prefill and self.config.spec_decode_model:
             running_seqs = [scheduled_seq.seq for scheduled_seq in seqs if not scheduled_seq.is_padding and not scheduled_seq.seq.is_finished]
             if running_seqs:
@@ -77,69 +91,73 @@ class LLMEngine:
                 bs = self.config.kvcache_block_size
 
                 # Step 1: Pre-allocate blocks for gamma draft tokens + 1 bonus token
+                spec_eligible_seqs = []
                 for seq in running_seqs:
                     current_len = len(seq)
                     needed_len = current_len + gamma + 1
                     current_blocks = len(seq.block_table)
                     needed_blocks = (needed_len + bs - 1) // bs
-                    for _ in range(needed_blocks - current_blocks):
-                        if bm.free_block_ids:
-                            block_id = bm.free_block_ids[0]
-                            block = bm.blocks[block_id]
-                            block.reset()
-                            bm.free_block_ids.remove(block_id)
-                            bm.used_block_ids.add(block_id)
-                            seq.block_table.append(block_id)
+                    blocks_needed = needed_blocks - current_blocks
+                    if blocks_needed > 0 and len(bm.free_block_ids) < blocks_needed:
+                        continue  # #2: skip seq if not enough free blocks
+                    for _ in range(blocks_needed):
+                        block_id = bm.free_block_ids[0]
+                        block = bm.blocks[block_id]
+                        block.reset()
+                        bm.free_block_ids.remove(block_id)
+                        bm.used_block_ids.add(block_id)
+                        seq.block_table.append(block_id)
+                    spec_eligible_seqs.append(seq)
 
-                # Step 2: Generate draft tokens
-                draft_tokens, draft_probs = self.model_runner.call("run_draft_decode", running_seqs)
+                if spec_eligible_seqs:
+                    # Step 2: Generate draft tokens
+                    draft_tokens, draft_probs = self.model_runner.call("run_draft_decode", spec_eligible_seqs)
 
-                # Step 3: Verify with target model
-                verify_results = self.model_runner.call("run_verify", running_seqs, draft_tokens, draft_probs)
+                    # Step 3: Verify with target model
+                    verify_results = self.model_runner.call("run_verify", spec_eligible_seqs, draft_tokens, draft_probs)
 
-                # Step 4: Apply accepted tokens to sequences
-                eos = self.config.eos
-                for seq, (accepted, num_accepted) in zip(running_seqs, verify_results):
-                    for tok in accepted:
-                        seq.append_token(tok)
-                        seq.num_computed_tokens += 1
-                        num_spec_tokens += 1
-                        if (not seq.ignore_eos and tok == eos) or seq.num_completion_tokens == seq.max_tokens:
-                            seq.status = SequenceStatus.FINISHED
-                            bm.deallocate(seq)
-                            if seq in self.scheduler.running:
-                                self.scheduler.running.discard(seq)
-                                self.scheduler._free_decode_slot(seq)
-                                self.scheduler._maybe_shrink_batch()
-                            break
+                    # Step 4: Apply accepted tokens to sequences
+                    eos = self.config.eos
+                    for seq, (accepted, draft_accepted_count) in zip(spec_eligible_seqs, verify_results):
+                        num_spec_proposed += gamma
+                        num_spec_accepted += draft_accepted_count
+                        for tok in accepted:
+                            seq.append_token(tok)
+                            seq.num_computed_tokens += 1
+                            num_spec_tokens += 1
+                            if (not seq.ignore_eos and tok == eos) or seq.num_completion_tokens == seq.max_tokens:
+                                seq.status = SequenceStatus.FINISHED
+                                bm.deallocate(seq)
+                                if seq in self.scheduler.running:
+                                    self.scheduler.running.discard(seq)
+                                    self.scheduler._free_decode_slot(seq)
+                                    self.scheduler._maybe_shrink_batch()
+                                break
 
-                # Step 5: Trim unused blocks and fix hash state for remaining sequences
-                for seq in running_seqs:
-                    if not seq.is_finished:
-                        needed_blocks = (len(seq) + bs - 1) // bs
-                        while len(seq.block_table) > needed_blocks:
-                            block_id = seq.block_table.pop()
-                            block = bm.blocks[block_id]
-                            block.ref_count -= 1
-                            if block.ref_count == 0:
-                                bm.used_block_ids.discard(block_id)
-                                bm.free_block_ids.append(block_id)
-                        # Fix hash state on blocks:
-                        # - Full blocks (not the last, or last when len%bs==0) should have hash set
-                        # - Partial last block (len%bs != 0) should have hash == -1
-                        for bi in range(len(seq.block_table)):
-                            block = bm.blocks[seq.block_table[bi]]
-                            is_last = (bi == len(seq.block_table) - 1)
-                            block_is_full = (not is_last) or (len(seq) % bs == 0)
-                            if block_is_full and block.hash == -1:
-                                token_ids = seq.block(bi)
-                                prefix = bm.blocks[seq.block_table[bi - 1]].hash if bi > 0 else -1
-                                h = bm.compute_hash(token_ids, prefix)
-                                block.update(h, token_ids)
-                                bm.hash_to_block_id[h] = block.block_id
-                            elif not block_is_full and block.hash != -1:
-                                block.hash = -1
-                                block.token_ids = []
+                    # Step 5: Trim unused blocks and fix hash state for remaining sequences
+                    for seq in spec_eligible_seqs:
+                        if not seq.is_finished:
+                            needed_blocks = (len(seq) + bs - 1) // bs
+                            while len(seq.block_table) > needed_blocks:
+                                block_id = seq.block_table.pop()
+                                block = bm.blocks[block_id]
+                                block.ref_count -= 1
+                                if block.ref_count == 0:
+                                    bm.used_block_ids.discard(block_id)
+                                    bm.free_block_ids.append(block_id)
+                            for bi in range(len(seq.block_table)):
+                                block = bm.blocks[seq.block_table[bi]]
+                                is_last = (bi == len(seq.block_table) - 1)
+                                block_is_full = (not is_last) or (len(seq) % bs == 0)
+                                if block_is_full and block.hash == -1:
+                                    token_ids_blk = seq.block(bi)
+                                    prefix = bm.blocks[seq.block_table[bi - 1]].hash if bi > 0 else -1
+                                    h = bm.compute_hash(token_ids_blk, prefix)
+                                    block.update(h, token_ids_blk)
+                                    bm.hash_to_block_id[h] = block.block_id
+                                elif not block_is_full and block.hash != -1:
+                                    block.hash = -1
+                                    block.token_ids = []
 
         outputs = [(scheduled_seq.seq.seq_id, scheduled_seq.seq.completion_token_ids) for scheduled_seq in seqs if not scheduled_seq.is_padding and scheduled_seq.seq.is_finished]
         num_prefill_tokens = sum(scheduled_seq.token_chunk_size for scheduled_seq in seqs if not scheduled_seq.is_padding) if is_prefill else 0

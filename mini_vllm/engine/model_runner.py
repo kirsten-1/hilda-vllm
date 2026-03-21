@@ -218,6 +218,38 @@ class ModelRunner:
                 layer_id += 1
 
     @torch.inference_mode()
+    def run_draft_prefill(self, seqs: list[Sequence]):
+        """Run draft model prefill for sequences that just completed target prefill."""
+        if not self.draft_model or not seqs:
+            return
+        all_input_ids = []
+        all_positions = []
+        cu_seqlens_q = [0]
+        cu_seqlens_k = [0]
+        max_seqlen_q = 0
+        max_seqlen_k = 0
+        all_slot_mapping = []
+        for seq in seqs:
+            prompt_len = seq.num_prompt_tokens
+            all_input_ids.extend(seq.prompt_token_ids)
+            all_positions.extend(range(prompt_len))
+            cu_seqlens_q.append(cu_seqlens_q[-1] + prompt_len)
+            cu_seqlens_k.append(cu_seqlens_k[-1] + prompt_len)
+            max_seqlen_q = max(prompt_len, max_seqlen_q)
+            max_seqlen_k = max(prompt_len, max_seqlen_k)
+            for position in range(prompt_len):
+                block_id = seq.block_table[position // self.block_size]
+                all_slot_mapping.append(block_id * self.block_size + position % self.block_size)
+        input_ids = torch.tensor(all_input_ids, dtype=torch.int64, device="cuda")
+        positions = torch.tensor(all_positions, dtype=torch.int64, device="cuda")
+        cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int32, device="cuda")
+        cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int32, device="cuda")
+        slot_mapping = torch.tensor(all_slot_mapping, dtype=torch.int32, device="cuda")
+        set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, None)
+        self.draft_model(input_ids, positions)
+        reset_context()
+
+    @torch.inference_mode()
     def run_draft_decode(self, seqs: list[Sequence]) -> tuple[list[list[int]], list[list[torch.Tensor]]]:
         """Generate gamma draft tokens per sequence autoregressively using decode path."""
         if not self.draft_model:
@@ -244,8 +276,8 @@ class ModelRunner:
             block_tables = self.prepare_block_tables(seqs)
             set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
             logits = self.draft_model.compute_logits(self.draft_model(input_ids, positions))
-            probs = torch.softmax(logits.float(), dim=-1)
             temperatures, top_ks, top_ps = self.prepare_sample(seqs)
+            probs = torch.softmax(logits.float() / temperatures.unsqueeze(1), dim=-1)
             draft_token_ids = self.sampler(logits, temperatures, top_ks, top_ps).tolist()
             for i, token_id in enumerate(draft_token_ids):
                 all_draft_tokens[i].append(token_id)

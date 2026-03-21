@@ -91,6 +91,7 @@ class Sequence:
     def __getstate__(self):
         token_state = self.token_ids if self.status == SequenceStatus.WAITING or self.num_completion_tokens == 0 else self.last_token
         return (
+            self.seq_id,
             self.status,
             self.num_tokens,
             self.num_prompt_tokens,
@@ -109,6 +110,7 @@ class Sequence:
 
     def __setstate__(self, state):
         (
+            self.seq_id,
             self.status,
             self.num_tokens,
             self.num_prompt_tokens,

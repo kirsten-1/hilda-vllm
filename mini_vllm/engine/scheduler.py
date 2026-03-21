@@ -70,6 +70,7 @@ class Scheduler:
 
     def _maybe_shrink_batch(self):
         if not self.running:
+            assert all(slot is None for slot in self.decode_slots)
             self.persistent_batch_size = 0
             self.free_slot_indices = deque(range(self.max_num_seqs))
 

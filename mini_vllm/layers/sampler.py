@@ -41,7 +41,7 @@ class Sampler(nn.Module):
         sorted_logits, sorted_indices = torch.sort(logits, dim=-1, descending=True)
         sorted_probs = torch.softmax(sorted_logits, dim=-1)
         cumulative_probs = torch.cumsum(sorted_probs, dim=-1)
-        keep_sorted = cumulative_probs <= top_ps.unsqueeze(1)
+        keep_sorted = cumulative_probs < top_ps.unsqueeze(1)
         keep_sorted[:, 0] = True
         masked_sorted_logits = sorted_logits.masked_fill(~keep_sorted, float("-inf"))
         return torch.scatter(torch.empty_like(logits), 1, sorted_indices, masked_sorted_logits)

@@ -1,4 +1,5 @@
 """Benchmark: Baseline vs Speculative Decoding comparison."""
+import argparse
 import json
 import os
 import sys
@@ -7,14 +8,26 @@ from pathlib import Path
 from random import randint, seed
 from time import perf_counter
 
-sys.path.insert(0, "/root/hilda-vllm/hilda-vllm")
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 
 from mini_vllm import LLM, SamplingParams
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="Spec decode benchmark")
+    parser.add_argument("--target-model", default="/root/autodl-tmp/Qwen3-8B")
+    parser.add_argument("--draft-model", default="/root/huggingface/Qwen3-0.6B")
+    parser.add_argument("--gamma", type=int, default=5)
+    parser.add_argument("--num-seqs", type=int, default=32)
+    parser.add_argument("--max-input-len", type=int, default=512)
+    parser.add_argument("--max-output-len", type=int, default=256)
+    parser.add_argument("--enforce-eager", action="store_true", default=False)
+    parser.add_argument("--output-dir", default="benchmarks/results")
+    return parser.parse_args()
+
+
 def run_benchmark(llm, prompt_token_ids, sampling_params_list, label):
     """Run benchmark and return stats dict."""
-    # Warmup
     llm.generate(["Benchmark warmup"], SamplingParams(), use_tqdm=False)
 
     prompts = prompt_token_ids
@@ -37,9 +50,9 @@ def run_benchmark(llm, prompt_token_ids, sampling_params_list, label):
 
 
 def print_comparison(baseline, spec):
-    print("\n" + "=" * 80)
+    print("\n" + "=" * 90)
     print("BENCHMARK COMPARISON: Baseline vs Speculative Decoding")
-    print("=" * 80)
+    print("=" * 90)
 
     metrics = [
         ("Total Throughput (tok/s)", "total_throughput_toks"),
@@ -49,6 +62,7 @@ def print_comparison(baseline, spec):
         ("Prefill Time (s)", "prefill_time_s"),
         ("Decode Time (s)", "decode_time_s"),
         ("Total Time (s)", "total_time_s"),
+        ("Spec Acceptance Rate", "spec_acceptance_rate"),
     ]
 
     header = f"{'Metric':<30} {'Baseline':>15} {'SpecDecode':>15} {'Delta':>10}"
@@ -61,37 +75,37 @@ def print_comparison(baseline, spec):
         if bv is not None and sv is not None:
             delta = ((sv - bv) / bv * 100) if bv != 0 else 0
             print(f"{name:<30} {bv:>15.2f} {sv:>15.2f} {delta:>+9.1f}%")
+        elif sv is not None:
+            print(f"{name:<30} {'n/a':>15} {sv:>15.2f} {'':>10}")
         else:
             bv_s = f"{bv:.2f}" if bv is not None else "n/a"
             sv_s = f"{sv:.2f}" if sv is not None else "n/a"
             print(f"{name:<30} {bv_s:>15} {sv_s:>15} {'n/a':>10}")
-    print("=" * 80)
+    print("=" * 90)
 
 
 def main():
+    args = parse_args()
     seed(0)
-    num_seqs = 64  # fewer seqs for faster benchmark
-    max_input_len = 512
-    max_output_len = 256
 
     prompt_token_ids = [
-        [randint(0, 10000) for _ in range(randint(50, max_input_len))]
-        for _ in range(num_seqs)
+        [randint(0, 10000) for _ in range(randint(50, args.max_input_len))]
+        for _ in range(args.num_seqs)
     ]
     sampling_params_list = [
-        SamplingParams(temperature=0.6, ignore_eos=True, max_tokens=randint(50, max_output_len))
-        for _ in range(num_seqs)
+        SamplingParams(temperature=0.6, ignore_eos=True, max_tokens=randint(50, args.max_output_len))
+        for _ in range(args.num_seqs)
     ]
 
-    output_dir = Path("/root/hilda-vllm/hilda-vllm/benchmarks/results")
+    output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
 
     # === Baseline ===
     print("=" * 60)
-    print("Running BASELINE benchmark (Qwen3-0.6B, no spec decode)...")
+    print(f"Running BASELINE benchmark ({args.target_model})...")
     print("=" * 60)
-    llm_base = LLM("/root/huggingface/Qwen3-0.6B", enforce_eager=True)
+    llm_base = LLM(args.target_model, enforce_eager=args.enforce_eager)
     baseline_result = run_benchmark(llm_base, prompt_token_ids, sampling_params_list, "baseline")
     llm_base.exit()
     del llm_base
@@ -102,15 +116,15 @@ def main():
 
     # === Speculative Decoding ===
     print("\n" + "=" * 60)
-    print("Running SPEC DECODE benchmark (target=Qwen3-0.6B, draft=Qwen2.5-0.5B-Instruct, gamma=5)...")
+    print(f"Running SPEC DECODE benchmark (target={args.target_model}, draft={args.draft_model}, gamma={args.gamma})...")
     print("=" * 60)
     llm_spec = LLM(
-        "/root/huggingface/Qwen3-0.6B",
-        spec_decode_model="/root/huggingface/Qwen2.5-0.5B-Instruct",
-        spec_decode_gamma=5,
-        enforce_eager=True,
+        args.target_model,
+        spec_decode_model=args.draft_model,
+        spec_decode_gamma=args.gamma,
+        enforce_eager=args.enforce_eager,
     )
-    spec_result = run_benchmark(llm_spec, prompt_token_ids, sampling_params_list, "spec-decode-gamma5")
+    spec_result = run_benchmark(llm_spec, prompt_token_ids, sampling_params_list, f"spec-decode-gamma{args.gamma}")
     llm_spec.exit()
     del llm_spec
 
@@ -120,6 +134,9 @@ def main():
     # === Save results ===
     combined = {
         "timestamp": timestamp,
+        "target_model": args.target_model,
+        "draft_model": args.draft_model,
+        "gamma": args.gamma,
         "baseline": baseline_result,
         "spec_decode": spec_result,
     }

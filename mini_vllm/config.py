@@ -23,6 +23,7 @@ class Config:
     kv_cache_dtype: str = "auto"
     spec_decode_model: str = ""
     spec_decode_gamma: int = 5
+    spec_decode_max_batch_size: int = 16
 
     def __post_init__(self):
         assert os.path.isdir(self.model)

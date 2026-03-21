@@ -91,6 +91,8 @@ def parse_args():
     parser.add_argument("--tensor-parallel-size", type=int, default=1)
     parser.add_argument("--kv-cache-dtype", choices=("auto", "fp8"), default="auto")
     parser.add_argument("--enforce-eager", action="store_true")
+    parser.add_argument("--spec-decode-model", default="")
+    parser.add_argument("--spec-decode-gamma", type=int, default=5)
     return parser.parse_args()
 
 
@@ -104,6 +106,8 @@ def main():
         max_model_len=args.max_model_len,
         max_num_batched_tokens=args.max_num_batched_tokens,
         tensor_parallel_size=args.tensor_parallel_size,
+        spec_decode_model=args.spec_decode_model,
+        spec_decode_gamma=args.spec_decode_gamma,
     )
     uvicorn.run(
         create_app(adapter),

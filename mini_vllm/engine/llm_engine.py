@@ -35,6 +35,8 @@ class LLMEngine:
         config.eos = self.tokenizer.eos_token_id
         self.scheduler = Scheduler(config)
         self.last_generate_stats = None
+        self._adaptive_gamma = config.spec_decode_gamma
+        self._gamma_window = []
         atexit.register(self.exit)
 
     def exit(self):
@@ -85,8 +87,8 @@ class LLMEngine:
         num_spec_accepted = 0
         if not is_prefill and self.config.spec_decode_model:
             running_seqs = [scheduled_seq.seq for scheduled_seq in seqs if not scheduled_seq.is_padding and not scheduled_seq.seq.is_finished]
-            if running_seqs:
-                gamma = self.config.spec_decode_gamma
+            if running_seqs and len(running_seqs) <= self.config.spec_decode_max_batch_size:
+                gamma = self._adaptive_gamma
                 bm = self.scheduler.block_manager
                 bs = self.config.kvcache_block_size
 
@@ -134,7 +136,10 @@ class LLMEngine:
                                     self.scheduler._maybe_shrink_batch()
                                 break
 
-                    # Step 5: Trim unused blocks and fix hash state for remaining sequences
+                    # Step 5: Clean dirty KV slots from rejected draft tokens
+                    self.model_runner.call("cleanup_rejected_kv_slots", spec_eligible_seqs, verify_results, gamma)
+
+                    # Step 6: Trim unused blocks and fix hash state for remaining sequences
                     for seq in spec_eligible_seqs:
                         if not seq.is_finished:
                             needed_blocks = (len(seq) + bs - 1) // bs
@@ -159,11 +164,24 @@ class LLMEngine:
                                     block.hash = -1
                                     block.token_ids = []
 
+                    # Adaptive gamma: adjust based on acceptance rate
+                    if num_spec_proposed > 0:
+                        step_rate = num_spec_accepted / num_spec_proposed
+                        self._gamma_window.append(step_rate)
+                        if len(self._gamma_window) > 20:
+                            self._gamma_window.pop(0)
+                        if len(self._gamma_window) >= 5:
+                            avg_rate = sum(self._gamma_window) / len(self._gamma_window)
+                            if avg_rate > 0.8 and self._adaptive_gamma < 8:
+                                self._adaptive_gamma += 1
+                            elif avg_rate < 0.4 and self._adaptive_gamma > 1:
+                                self._adaptive_gamma -= 1
+
         outputs = [(scheduled_seq.seq.seq_id, scheduled_seq.seq.completion_token_ids) for scheduled_seq in seqs if not scheduled_seq.is_padding and scheduled_seq.seq.is_finished]
         num_prefill_tokens = sum(scheduled_seq.token_chunk_size for scheduled_seq in seqs if not scheduled_seq.is_padding) if is_prefill else 0
         num_decode_tokens = sum(1 for sseq, tid in zip(seqs, token_ids) if not sseq.is_padding and tid is not None) if is_prefill else sum(1 for sseq in seqs if not sseq.is_padding)
         num_decode_tokens += num_spec_tokens
-        return outputs, num_prefill_tokens, num_decode_tokens
+        return outputs, num_prefill_tokens, num_decode_tokens, num_spec_proposed, num_spec_accepted
 
     def is_finished(self):
         return self.scheduler.is_finished()
@@ -180,9 +198,9 @@ class LLMEngine:
         total_start = perf_counter()
         while not self.is_finished():
             t = perf_counter()
-            _, num_prefill_tokens, num_decode_tokens = self.step()
+            _, num_prefill_tokens, num_decode_tokens, proposed, accepted = self.step()
             elapsed = perf_counter() - t
-            self._update_generate_stats(stats, num_prefill_tokens, num_decode_tokens, elapsed)
+            self._update_generate_stats(stats, num_prefill_tokens, num_decode_tokens, elapsed, proposed, accepted)
             for seq in seqs:
                 completion_token_ids = seq.completion_token_ids
                 previous_count = emitted_completion_tokens[seq.seq_id]
@@ -214,9 +232,9 @@ class LLMEngine:
         total_start = perf_counter()
         while not self.is_finished():
             t = perf_counter()
-            output, num_prefill_tokens, num_decode_tokens = self.step()
+            output, num_prefill_tokens, num_decode_tokens, proposed, accepted = self.step()
             elapsed = perf_counter() - t
-            prefill_throughput, decode_throughput = self._update_generate_stats(stats, num_prefill_tokens, num_decode_tokens, elapsed)
+            prefill_throughput, decode_throughput = self._update_generate_stats(stats, num_prefill_tokens, num_decode_tokens, elapsed, proposed, accepted)
             if use_tqdm:
                 pbar.set_postfix({
                     "Prefill": f"{int(prefill_throughput)}tok/s",
@@ -255,10 +273,12 @@ class LLMEngine:
             "decode_tokens": 0,
             "prefill_time_s": 0.0,
             "decode_time_s": 0.0,
+            "spec_proposed": 0,
+            "spec_accepted": 0,
         }
 
     @staticmethod
-    def _update_generate_stats(stats: dict, num_prefill_tokens: int, num_decode_tokens: int, elapsed: float) -> tuple[float, float]:
+    def _update_generate_stats(stats: dict, num_prefill_tokens: int, num_decode_tokens: int, elapsed: float, spec_proposed: int = 0, spec_accepted: int = 0) -> tuple[float, float]:
         prefill_throughput = 0.0
         decode_throughput = 0.0
         if num_prefill_tokens > 0:
@@ -269,6 +289,8 @@ class LLMEngine:
             stats["decode_tokens"] += num_decode_tokens
             stats["decode_time_s"] += elapsed
             decode_throughput = num_decode_tokens / elapsed if elapsed else 0.0
+        stats["spec_proposed"] += spec_proposed
+        stats["spec_accepted"] += spec_accepted
         return prefill_throughput, decode_throughput
 
     def _set_last_generate_stats(self, stats: dict, total_time: float):
@@ -285,4 +307,7 @@ class LLMEngine:
             "prefill_throughput_toks": stats["prefill_tokens"] / stats["prefill_time_s"] if stats["prefill_time_s"] else 0.0,
             "decode_throughput_toks": stats["decode_tokens"] / stats["decode_time_s"] if stats["decode_time_s"] else 0.0,
             "total_throughput_toks": total_output_tokens / total_time if total_time else 0.0,
+            "spec_proposed": stats["spec_proposed"],
+            "spec_accepted": stats["spec_accepted"],
+            "spec_acceptance_rate": stats["spec_accepted"] / stats["spec_proposed"] if stats["spec_proposed"] > 0 else 0.0,
         }

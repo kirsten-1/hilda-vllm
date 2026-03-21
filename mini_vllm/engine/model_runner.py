@@ -60,6 +60,8 @@ class ModelRunner:
             self.allocate_draft_kv_cache()
         if not self.enforce_eager:
             self.capture_cudagraph()
+            if self.use_spec_decode:
+                self.capture_draft_cudagraph()
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
 
@@ -275,13 +277,13 @@ class ModelRunner:
             slot_mapping = torch.tensor(slot_mapping_list, dtype=torch.int32, device="cuda")
             block_tables = self.prepare_block_tables(seqs)
             set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
-            logits = self.draft_model.compute_logits(self.draft_model(input_ids, positions))
+            logits = self.run_draft_model(input_ids, positions)
             temperatures, top_ks, top_ps = self.prepare_sample(seqs)
             probs = torch.softmax(logits.float() / temperatures.unsqueeze(1), dim=-1)
             draft_token_ids = self.sampler(logits, temperatures, top_ks, top_ps).tolist()
             for i, token_id in enumerate(draft_token_ids):
                 all_draft_tokens[i].append(token_id)
-                all_draft_probs[i].append(probs[i].cpu())
+                all_draft_probs[i].append(probs[i])
                 tokens_added[i] += 1
             reset_context()
         return all_draft_tokens, all_draft_probs
@@ -345,43 +347,99 @@ class ModelRunner:
         logits = torch.nn.functional.linear(hidden_states, self.model.lm_head.weight)
         reset_context()
 
-        # Apply rejection sampling per sequence
+        # Vectorized rejection sampling
         results = []
         offset = 0
+        gamma = self.gamma
         for i, seq in enumerate(seqs):
             num_verify = seq_verify_lens[i]
-            seq_logits = logits[offset:offset + num_verify]  # (gamma+1, vocab)
+            num_draft = len(draft_tokens[i])
+            seq_logits = logits[offset:offset + num_verify]
             offset += num_verify
 
             temperature = seq.temperature
             target_probs = torch.softmax(seq_logits.float() / temperature, dim=-1)
 
-            accepted_tokens = []
-            for j in range(len(draft_tokens[i])):
-                draft_tok = draft_tokens[i][j]
-                p_target = target_probs[j, draft_tok].item()
-                p_draft = draft_probs[i][j][draft_tok].item()
-                accept_prob = min(1.0, p_target / max(p_draft, 1e-10))
-                if torch.rand(1).item() < accept_prob:
-                    accepted_tokens.append(draft_tok)
-                else:
-                    # Rejection: sample from adjusted distribution max(0, p_target - p_draft)
-                    adjusted = torch.clamp(target_probs[j] - draft_probs[i][j].to(target_probs.device), min=0)
-                    adjusted_sum = adjusted.sum()
-                    if adjusted_sum > 1e-10:
-                        adjusted = adjusted / adjusted_sum
-                    else:
-                        adjusted = target_probs[j]
-                    bonus_token = torch.multinomial(adjusted, 1).item()
-                    accepted_tokens.append(bonus_token)
-                    break
+            # Stack draft probs and get token indices
+            draft_tok_ids = torch.tensor(draft_tokens[i], dtype=torch.int64, device=target_probs.device)
+            draft_probs_stacked = torch.stack(draft_probs[i])  # (num_draft, vocab)
+
+            # Gather p_target and p_draft for draft tokens
+            p_target = target_probs[:num_draft].gather(1, draft_tok_ids.unsqueeze(1)).squeeze(1)
+            p_draft = draft_probs_stacked.gather(1, draft_tok_ids.unsqueeze(1)).squeeze(1)
+
+            # Compute acceptance probabilities and random numbers
+            accept_probs = torch.clamp(p_target / p_draft.clamp(min=1e-10), max=1.0)
+            rand_vals = torch.rand(num_draft, device=target_probs.device)
+            accepted_mask = rand_vals < accept_probs
+
+            # Find first rejection point
+            if accepted_mask.all():
+                # All accepted - take all draft tokens + bonus from last position
+                accepted_tokens = draft_tok_ids.tolist()
+                bonus_token = torch.multinomial(target_probs[num_draft], 1).item()
+                accepted_tokens.append(bonus_token)
+                draft_accepted_count = num_draft
             else:
-                # All draft tokens accepted, sample bonus token from last target position
-                bonus_token = torch.multinomial(target_probs[len(draft_tokens[i])], 1).item()
+                first_reject = (~accepted_mask).nonzero(as_tuple=True)[0][0].item()
+                accepted_tokens = draft_tok_ids[:first_reject].tolist()
+                draft_accepted_count = first_reject
+                # Sample from adjusted distribution at rejection point
+                adjusted = torch.clamp(target_probs[first_reject] - draft_probs_stacked[first_reject], min=0)
+                adjusted_sum = adjusted.sum()
+                if adjusted_sum > 1e-10:
+                    adjusted = adjusted / adjusted_sum
+                else:
+                    adjusted = target_probs[first_reject]
+                bonus_token = torch.multinomial(adjusted, 1).item()
                 accepted_tokens.append(bonus_token)
 
-            results.append((accepted_tokens, len(accepted_tokens)))
+            results.append((accepted_tokens, draft_accepted_count))
         return results
+
+    @torch.inference_mode()
+    def cleanup_rejected_kv_slots(self, seqs: list[Sequence], verify_results: list[tuple[list[int], int]], gamma: int):
+        """Zero out KV cache slots for rejected draft tokens to prevent dirty reads.
+        After verify, positions [len(seq)..len(seq)+gamma-num_accepted-1] may have dirty KV
+        in both target and draft caches. Since context_lens prevents reading them, this is
+        a defensive cleanup for correctness safety."""
+        dirty_slots = []
+        for seq, (accepted, draft_accepted_count) in zip(seqs, verify_results):
+            # accepted includes bonus token, so total positions written = len(accepted)
+            # but seq.len was len(seq) at verify time. After appending accepted tokens,
+            # seq.len = old_len + len(accepted). The dirty slots are from
+            # old_len + len(accepted) to old_len + gamma (the slots written during verify
+            # but beyond what was accepted).
+            num_written = gamma + 1  # verify wrote gamma+1 positions (including last_token re-write)
+            num_kept = len(accepted)  # tokens actually accepted + bonus
+            # Dirty positions: from (old_len - 1 + num_kept + 1) to (old_len - 1 + num_written)
+            # But old_len already advanced by num_kept via append_token, so:
+            cur_len = len(seq)
+            old_len = cur_len - num_kept
+            for pos in range(old_len + num_kept, old_len + num_written):
+                if pos < 0:
+                    continue
+                block_idx = pos // self.block_size
+                if block_idx < len(seq.block_table):
+                    block_id = seq.block_table[block_idx]
+                    dirty_slots.append(block_id * self.block_size + pos % self.block_size)
+        if not dirty_slots:
+            return
+        # Zero the dirty slots in target KV cache
+        slot_tensor = torch.tensor(dirty_slots, dtype=torch.int64, device="cuda")
+        if self.use_fp8_kv_cache:
+            for layer_id in range(self.decode_kv_cache.shape[1]):
+                self.decode_kv_cache[0, layer_id].view(-1, self.decode_kv_cache.shape[-1])[slot_tensor] = 0
+                self.decode_kv_cache[1, layer_id].view(-1, self.decode_kv_cache.shape[-1])[slot_tensor] = 0
+        elif hasattr(self, 'kv_cache'):
+            for layer_id in range(self.kv_cache.shape[1]):
+                self.kv_cache[0, layer_id].view(-1, self.kv_cache.shape[-1])[slot_tensor] = 0
+                self.kv_cache[1, layer_id].view(-1, self.kv_cache.shape[-1])[slot_tensor] = 0
+        # Zero the dirty slots in draft KV cache
+        if hasattr(self, 'draft_kv_cache'):
+            for layer_id in range(self.draft_kv_cache.shape[1]):
+                self.draft_kv_cache[0, layer_id].view(-1, self.draft_kv_cache.shape[-1])[slot_tensor] = 0
+                self.draft_kv_cache[1, layer_id].view(-1, self.draft_kv_cache.shape[-1])[slot_tensor] = 0
 
     @torch.inference_mode()
     def convert_prefill_to_decode_cache(self, seqs: list[Sequence]):
@@ -589,3 +647,60 @@ class ModelRunner:
             block_tables=block_tables,
             outputs=outputs,
         )
+
+    @torch.inference_mode()
+    def capture_draft_cudagraph(self):
+        """Capture CUDA graphs for the draft model decode path."""
+        config = self.config
+        draft_hf_config = config.draft_hf_config
+        max_bs = min(config.spec_decode_max_batch_size, 512)
+        max_num_blocks = (config.max_model_len + self.block_size - 1) // self.block_size
+        input_ids = torch.zeros(max_bs, dtype=torch.int64)
+        positions = torch.zeros(max_bs, dtype=torch.int64)
+        slot_mapping = torch.zeros(max_bs, dtype=torch.int32)
+        context_lens = torch.zeros(max_bs, dtype=torch.int32)
+        block_tables = torch.zeros(max_bs, max_num_blocks, dtype=torch.int32)
+        outputs = torch.zeros(max_bs, draft_hf_config.hidden_size)
+        self.draft_graph_bs = [1, 2, 4, 8] + list(range(16, max_bs + 1, 16))
+        self.draft_graphs = {}
+        self.draft_graph_pool = None
+
+        for bs in reversed(self.draft_graph_bs):
+            graph = torch.cuda.CUDAGraph()
+            set_context(False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs])
+            outputs[:bs] = self.draft_model(input_ids[:bs], positions[:bs])
+            with torch.cuda.graph(graph, self.draft_graph_pool):
+                outputs[:bs] = self.draft_model(input_ids[:bs], positions[:bs])
+            if self.draft_graph_pool is None:
+                self.draft_graph_pool = graph.pool()
+            self.draft_graphs[bs] = graph
+            torch.cuda.synchronize()
+            reset_context()
+
+        self.draft_graph_vars = dict(
+            input_ids=input_ids,
+            positions=positions,
+            slot_mapping=slot_mapping,
+            context_lens=context_lens,
+            block_tables=block_tables,
+            outputs=outputs,
+        )
+
+    @torch.inference_mode()
+    def run_draft_model(self, input_ids: torch.Tensor, positions: torch.Tensor):
+        """Run draft model with CUDA graph support."""
+        if self.enforce_eager or not hasattr(self, 'draft_graphs') or input_ids.size(0) > 512:
+            return self.draft_model.compute_logits(self.draft_model(input_ids, positions))
+        bs = input_ids.size(0)
+        context = get_context()
+        graph = self.draft_graphs[next(x for x in self.draft_graph_bs if x >= bs)]
+        gv = self.draft_graph_vars
+        gv["input_ids"][:bs] = input_ids
+        gv["positions"][:bs] = positions
+        gv["slot_mapping"].fill_(-1)
+        gv["slot_mapping"][:bs] = context.slot_mapping
+        gv["context_lens"].zero_()
+        gv["context_lens"][:bs] = context.context_lens
+        gv["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
+        graph.replay()
+        return self.draft_model.compute_logits(gv["outputs"][:bs])

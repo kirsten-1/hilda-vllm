@@ -7,3 +7,5 @@ numpy
 tqdm
 safetensors
 pytest
+fastapi
+uvicorn

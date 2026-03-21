@@ -56,8 +56,5 @@ PYTHONPATH=. python benchmarks/bench_decode_heavy.py --model /root/huggingface/Q
 
 ## Next
 
-Start with Chunked Prefill.
-
-- Changes stay mostly in scheduler + model_runner.
-- It is easy to validate with long-prompt decode latency.
-- It is a good base for later work like speculative decoding.
+- Speculative Decoding (in progress)
+- OpenAI API Server (in progress)

@@ -8,7 +8,7 @@ Performance Results:
 | --- | ---: | ---: | ---: |
 | vllm | 133,966 | 12.79 | 10473.98 |
 | nano-vllm | 133,966 | 13.75 | 9740.91 |
-| hilda-vllm | 133,966 | 12.99 | 10311.53 |
+| hilda-vllm | 133,966 | 12.98 | 10317.81 |
 
 ## Decode Jitter
 
@@ -16,7 +16,7 @@ Mixed long-prefill + short-decode benchmark:
 
 | Inference Engine | Mixed Decode P50 (ms) | Mixed Decode P95 (ms) | Mixed Decode Max (ms) | Mixed Decode Steps |
 | --- | ---: | ---: | ---: | ---: |
-| hilda-vllm | 134.30 | 233.51 | 244.53 | 2 |
+| hilda-vllm | 5.72 | 124.04 | 196.16 | 18 |
 
 ## Commands
 

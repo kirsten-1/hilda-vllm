@@ -15,10 +15,12 @@ def parse_args():
     parser.add_argument("--model", default=os.path.expanduser("~/huggingface/Qwen3-0.6B/"))
     parser.add_argument("--engine-name", default="hilda-vllm")
     parser.add_argument("--output-dir", default="benchmarks/results")
-    parser.add_argument("--long-prompt-len", type=int, default=3072)
-    parser.add_argument("--short-prompt-len", type=int, default=128)
-    parser.add_argument("--num-short-seqs", type=int, default=128)
-    parser.add_argument("--short-output-len", type=int, default=64)
+    parser.add_argument("--long-prompt-len", type=int, default=4096)
+    parser.add_argument("--num-long-seqs", type=int, default=4)
+    parser.add_argument("--short-prompt-len", type=int, default=64)
+    parser.add_argument("--num-short-seqs", type=int, default=256)
+    parser.add_argument("--short-output-len", type=int, default=128)
+    parser.add_argument("--max-num-batched-tokens", type=int, default=8192)
     return parser.parse_args()
 
 
@@ -64,6 +66,7 @@ def build_result(args, llm, total_time_s, decode_latencies_ms, mixed_decode_late
         "backend": "hilda-vllm",
         "model": os.path.expanduser(args.model),
         "long_prompt_tokens": args.long_prompt_len,
+        "num_long_requests": args.num_long_seqs,
         "short_prompt_tokens": args.short_prompt_len,
         "num_short_requests": args.num_short_seqs,
         "short_output_tokens": short_output_tokens,
@@ -98,19 +101,25 @@ def main():
     llm = LLM(
         os.path.expanduser(args.model),
         enforce_eager=False,
-        max_model_len=4096,
+        max_model_len=args.long_prompt_len + 256,
+        max_num_batched_tokens=args.max_num_batched_tokens,
     )
     llm.generate(["Benchmark: "], SamplingParams(), use_tqdm=False)
 
-    long_prompt = [randint(0, 10000) for _ in range(args.long_prompt_len)]
+    long_prompts = [
+        [randint(0, 10000) for _ in range(args.long_prompt_len)]
+        for _ in range(args.num_long_seqs)
+    ]
     short_prompts = [
         [randint(0, 10000) for _ in range(args.short_prompt_len)]
         for _ in range(args.num_short_seqs)
     ]
 
-    llm.add_request(long_prompt, SamplingParams(temperature=0.6, ignore_eos=True, max_tokens=1))
+    llm.add_request(long_prompts[0], SamplingParams(temperature=0.6, ignore_eos=True, max_tokens=1))
     for prompt in short_prompts:
         llm.add_request(prompt, SamplingParams(temperature=0.6, ignore_eos=True, max_tokens=args.short_output_len))
+    for prompt in long_prompts[1:]:
+        llm.add_request(prompt, SamplingParams(temperature=0.6, ignore_eos=True, max_tokens=1))
 
     decode_latencies_ms = []
     mixed_decode_latencies_ms = []

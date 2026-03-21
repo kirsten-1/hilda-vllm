@@ -10,8 +10,14 @@ from mini_vllm.engine.sequence import Sequence
 from mini_vllm.layers.attention import copy_kvcache_fp8
 from mini_vllm.layers.sampler import Sampler
 from mini_vllm.models.qwen3 import Qwen3ForCausalLM
+from mini_vllm.models.qwen2 import Qwen2ForCausalLM
 from mini_vllm.utils.context import get_context, reset_context, set_context
 from mini_vllm.utils.loader import load_model
+
+MODEL_REGISTRY = {
+    "qwen3": Qwen3ForCausalLM,
+    "qwen2": Qwen2ForCausalLM,
+}
 
 
 class ModelRunner:
@@ -25,17 +31,33 @@ class ModelRunner:
         self.rank = rank
         self.event = event
         self.use_fp8_kv_cache = config.kv_cache_dtype == "fp8"
+        self.use_spec_decode = bool(config.spec_decode_model)
+        self.gamma = config.spec_decode_gamma
 
         dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
         torch.cuda.set_device(rank)
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.torch_dtype)
         torch.set_default_device("cuda")
-        self.model = Qwen3ForCausalLM(hf_config)
+        target_cls = MODEL_REGISTRY.get(hf_config.model_type, Qwen3ForCausalLM)
+        self.model = target_cls(hf_config)
         load_model(self.model, config.model)
         self.sampler = Sampler()
+
+        # Load draft model if speculative decoding is enabled
+        self.draft_model = None
+        if self.use_spec_decode:
+            draft_hf_config = config.draft_hf_config
+            torch.set_default_dtype(draft_hf_config.torch_dtype)
+            draft_cls = MODEL_REGISTRY.get(draft_hf_config.model_type, Qwen3ForCausalLM)
+            self.draft_model = draft_cls(draft_hf_config)
+            load_model(self.draft_model, config.spec_decode_model)
+            torch.set_default_dtype(hf_config.torch_dtype)
+
         self.warmup_model()
         self.allocate_kv_cache()
+        if self.use_spec_decode:
+            self.allocate_draft_kv_cache()
         if not self.enforce_eager:
             self.capture_cudagraph()
         torch.set_default_device("cpu")
@@ -167,6 +189,167 @@ class ModelRunner:
                     module.k_cache = self.kv_cache[0, layer_id]
                     module.v_cache = self.kv_cache[1, layer_id]
                 layer_id += 1
+
+    def allocate_draft_kv_cache(self):
+        """Allocate separate KV cache for the draft model."""
+        config = self.config
+        draft_hf_config = config.draft_hf_config
+        num_kv_heads = draft_hf_config.num_key_value_heads // self.world_size
+        head_dim = getattr(draft_hf_config, "head_dim", draft_hf_config.hidden_size // draft_hf_config.num_attention_heads)
+        dtype = draft_hf_config.torch_dtype
+        # Draft model shares the same number of blocks as the target model
+        num_blocks = config.num_kvcache_blocks
+        self.draft_kv_cache = torch.empty(
+            2,
+            draft_hf_config.num_hidden_layers,
+            num_blocks,
+            self.block_size,
+            num_kv_heads,
+            head_dim,
+            dtype=dtype,
+            device="cuda",
+        )
+        layer_id = 0
+        for module in self.draft_model.modules():
+            if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
+                module.kv_cache_dtype = "auto"
+                module.k_cache = self.draft_kv_cache[0, layer_id]
+                module.v_cache = self.draft_kv_cache[1, layer_id]
+                layer_id += 1
+
+    @torch.inference_mode()
+    def run_draft_decode(self, seqs: list[Sequence]) -> tuple[list[list[int]], list[list[torch.Tensor]]]:
+        """Generate gamma draft tokens per sequence autoregressively using decode path."""
+        if not self.draft_model:
+            return [[] for _ in seqs], [[] for _ in seqs]
+        all_draft_tokens = [[] for _ in range(len(seqs))]
+        all_draft_probs = [[] for _ in range(len(seqs))]
+        tokens_added = [0] * len(seqs)
+        for step in range(self.gamma):
+            input_ids_list = []
+            context_lens_list = []
+            slot_mapping_list = []
+            for i, seq in enumerate(seqs):
+                cur_len = len(seq) + tokens_added[i]
+                last_tok = all_draft_tokens[i][-1] if all_draft_tokens[i] else seq.last_token
+                input_ids_list.append(last_tok)
+                context_lens_list.append(cur_len)
+                num_blocks_needed = (cur_len + self.block_size - 1) // self.block_size
+                last_block_tokens = cur_len - (num_blocks_needed - 1) * self.block_size
+                slot_mapping_list.append(seq.block_table[num_blocks_needed - 1] * self.block_size + last_block_tokens - 1)
+            input_ids = torch.tensor(input_ids_list, dtype=torch.int64, device="cuda")
+            context_lens = torch.tensor(context_lens_list, dtype=torch.int32, device="cuda")
+            positions = (context_lens - 1).to(dtype=torch.int64)
+            slot_mapping = torch.tensor(slot_mapping_list, dtype=torch.int32, device="cuda")
+            block_tables = self.prepare_block_tables(seqs)
+            set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
+            logits = self.draft_model.compute_logits(self.draft_model(input_ids, positions))
+            probs = torch.softmax(logits.float(), dim=-1)
+            temperatures = self.prepare_sample(seqs)
+            draft_token_ids = self.sampler(logits, temperatures).tolist()
+            for i, token_id in enumerate(draft_token_ids):
+                all_draft_tokens[i].append(token_id)
+                all_draft_probs[i].append(probs[i].cpu())
+                tokens_added[i] += 1
+            reset_context()
+        return all_draft_tokens, all_draft_probs
+
+    @torch.inference_mode()
+    def run_verify(self, seqs: list[Sequence], draft_tokens: list[list[int]], draft_probs: list[list[torch.Tensor]]) -> list[tuple[list[int], int]]:
+        """
+        Verify draft tokens using the target model.
+        Runs target model on draft tokens in a single prefill-like pass
+        using block_tables to read existing cached KV.
+        Returns list of (accepted_token_ids, num_accepted) per sequence.
+        """
+        # Build verification inputs: for each seq, feed [draft_tok_0, ..., draft_tok_(gamma-1)]
+        # The KV for positions before these draft tokens is already in the target cache.
+        # We also need the logit at position (len(seq)-1) to verify the first draft token,
+        # but that token's KV is already cached, so we re-feed it to get its logit.
+        all_input_ids = []
+        all_positions = []
+        cu_seqlens_q = [0]
+        cu_seqlens_k = [0]
+        max_seqlen_q = 0
+        max_seqlen_k = 0
+        all_slot_mapping = []
+        seq_verify_lens = []
+
+        for i, seq in enumerate(seqs):
+            # We need gamma+1 logits: one for each draft token verification + bonus
+            # Feed: [last_token_already_decoded, draft_0, ..., draft_(gamma-1)]
+            # last_token is at position len(seq)-1 (already in cache, will be overwritten - that's ok)
+            verify_tokens = [seq.last_token] + draft_tokens[i]
+            num_verify = len(verify_tokens)
+            seq_verify_lens.append(num_verify)
+            start_pos = len(seq) - 1
+
+            all_input_ids.extend(verify_tokens)
+            all_positions.extend(range(start_pos, start_pos + num_verify))
+
+            seqlen_q = num_verify
+            seqlen_k = start_pos + num_verify  # total context including cached KV
+            cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen_q)
+            cu_seqlens_k.append(cu_seqlens_k[-1] + seqlen_k)
+            max_seqlen_q = max(seqlen_q, max_seqlen_q)
+            max_seqlen_k = max(seqlen_k, max_seqlen_k)
+
+            for pos in range(start_pos, start_pos + num_verify):
+                block_idx = pos // self.block_size
+                block_id = seq.block_table[block_idx]
+                all_slot_mapping.append(block_id * self.block_size + pos % self.block_size)
+
+        input_ids = torch.tensor(all_input_ids, dtype=torch.int64, device="cuda")
+        positions = torch.tensor(all_positions, dtype=torch.int64, device="cuda")
+        cu_seqlens_q_t = torch.tensor(cu_seqlens_q, dtype=torch.int32, device="cuda")
+        cu_seqlens_k_t = torch.tensor(cu_seqlens_k, dtype=torch.int32, device="cuda")
+        slot_mapping = torch.tensor(all_slot_mapping, dtype=torch.int32, device="cuda")
+        block_tables = self.prepare_block_tables(seqs)
+
+        set_context(True, cu_seqlens_q_t, cu_seqlens_k_t, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables)
+        hidden_states = self.model(input_ids, positions)
+        # Do NOT use compute_logits here because ParallelLMHead in prefill mode
+        # only returns last-token logits per seq. We need logits for ALL verify tokens.
+        logits = torch.nn.functional.linear(hidden_states, self.model.lm_head.weight)
+        reset_context()
+
+        # Apply rejection sampling per sequence
+        results = []
+        offset = 0
+        for i, seq in enumerate(seqs):
+            num_verify = seq_verify_lens[i]
+            seq_logits = logits[offset:offset + num_verify]  # (gamma+1, vocab)
+            offset += num_verify
+
+            temperature = seq.temperature
+            target_probs = torch.softmax(seq_logits.float() / temperature, dim=-1)
+
+            accepted_tokens = []
+            for j in range(len(draft_tokens[i])):
+                draft_tok = draft_tokens[i][j]
+                p_target = target_probs[j, draft_tok].item()
+                p_draft = draft_probs[i][j][draft_tok].item()
+                accept_prob = min(1.0, p_target / max(p_draft, 1e-10))
+                if torch.rand(1).item() < accept_prob:
+                    accepted_tokens.append(draft_tok)
+                else:
+                    # Rejection: sample from adjusted distribution max(0, p_target - p_draft)
+                    adjusted = torch.clamp(target_probs[j] - draft_probs[i][j].to(target_probs.device), min=0)
+                    adjusted_sum = adjusted.sum()
+                    if adjusted_sum > 1e-10:
+                        adjusted = adjusted / adjusted_sum
+                    else:
+                        adjusted = target_probs[j]
+                    bonus_token = torch.multinomial(adjusted, 1).item()
+                    accepted_tokens.append(bonus_token)
+                    break
+            else:
+                # All draft tokens accepted, sample bonus token from last target position
+                bonus_token = torch.multinomial(target_probs[len(draft_tokens[i])], 1).item()
+                accepted_tokens.append(bonus_token)
+
+            results.append((accepted_tokens, len(accepted_tokens)))
+        return results
 
     @torch.inference_mode()
     def convert_prefill_to_decode_cache(self, seqs: list[Sequence]):

@@ -1,0 +1,31 @@
+{
+  "timestamp": "20260321T165402Z",
+  "baseline": {
+    "label": "baseline",
+    "num_requests": 64,
+    "prompt_tokens": 17344,
+    "output_tokens": 9024,
+    "total_time_s": 5.130921671050601,
+    "total_throughput_toks": 1758.7483455291683,
+    "prefill_tokens": 17344,
+    "decode_tokens": 9024,
+    "prefill_time_s": 0.2790896811056882,
+    "decode_time_s": 5.130261382320896,
+    "prefill_throughput_toks": 62144.89884143017,
+    "decode_throughput_toks": 1758.9747046996663
+  },
+  "spec_decode": {
+    "label": "spec-decode-gamma5",
+    "num_requests": 64,
+    "prompt_tokens": 17344,
+    "output_tokens": 9024,
+    "total_time_s": 19.436704150983132,
+    "total_throughput_toks": 464.2762440536275,
+    "prefill_tokens": 17344,
+    "decode_tokens": 16822,
+    "prefill_time_s": 0.12313509406521916,
+    "decode_time_s": 19.43632407276891,
+    "prefill_throughput_toks": 140853.42713762543,
+    "decode_throughput_toks": 865.4928749396761
+  }
+}

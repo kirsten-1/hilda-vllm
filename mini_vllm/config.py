@@ -21,6 +21,8 @@ class Config:
     kvcache_block_size: int = 256
     num_kvcache_blocks: int = -1
     kv_cache_dtype: str = "auto"
+    spec_decode_model: str = ""
+    spec_decode_gamma: int = 5
 
     def __post_init__(self):
         assert os.path.isdir(self.model)
@@ -31,6 +33,12 @@ class Config:
         assert self.kvcache_block_size % 256 == 0
         assert 1 <= self.tensor_parallel_size <= 8
         assert self.kv_cache_dtype in {"auto", "fp8"}
+        assert self.spec_decode_gamma >= 1
         self.hf_config = AutoConfig.from_pretrained(self.model)
         self.max_model_len = min(self.max_model_len, self.hf_config.max_position_embeddings)
         assert self.max_num_batched_tokens >= self.max_model_len
+        if self.spec_decode_model:
+            assert os.path.isdir(self.spec_decode_model), f"Draft model not found: {self.spec_decode_model}"
+            self.draft_hf_config = AutoConfig.from_pretrained(self.spec_decode_model)
+        else:
+            self.draft_hf_config = None

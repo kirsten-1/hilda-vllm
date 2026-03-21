@@ -56,7 +56,7 @@ class LLMEngine:
         self.scheduler.postprocess(seqs, token_ids, is_prefill)
         outputs = [(scheduled_seq.seq.seq_id, scheduled_seq.seq.completion_token_ids) for scheduled_seq in seqs if scheduled_seq.seq.is_finished]
         num_prefill_tokens = sum(scheduled_seq.token_chunk_size for scheduled_seq in seqs) if is_prefill else 0
-        num_decode_tokens = sum(token_id is not None for token_id in token_ids)
+        num_decode_tokens = sum(token_id is not None for token_id in token_ids) if is_prefill else len(token_ids)
         return outputs, num_prefill_tokens, num_decode_tokens
 
     def is_finished(self):

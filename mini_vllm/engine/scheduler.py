@@ -146,20 +146,29 @@ class Scheduler:
         self.waiting.append(seq)
 
     def postprocess(self, seqs: list[ScheduledSequence], token_ids: list[int | None], is_prefill: bool):
+        if not is_prefill:
+            for scheduled_seq, token_id in zip(seqs, token_ids):
+                seq = scheduled_seq.seq
+                assert token_id is not None
+                seq.num_computed_tokens += 1
+                seq.append_token(token_id)
+                if (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens == seq.max_tokens:
+                    seq.status = SequenceStatus.FINISHED
+                    self.block_manager.deallocate(seq)
+                    self.running.remove(seq)
+            return
+
         for scheduled_seq, token_id in zip(seqs, token_ids):
             seq = scheduled_seq.seq
-            if is_prefill:
-                reached_sequence_end = seq.num_computed_tokens + scheduled_seq.token_chunk_size >= len(seq)
-                seq.num_computed_tokens = min(len(seq), seq.num_computed_tokens + scheduled_seq.token_chunk_size)
-                if reached_sequence_end:
-                    self.waiting.remove(seq)
-                    seq.status = SequenceStatus.RUNNING
-                    self.running.append(seq)
-                else:
-                    self._append_waiting(seq)
-                    continue
+            reached_sequence_end = seq.num_computed_tokens + scheduled_seq.token_chunk_size >= len(seq)
+            seq.num_computed_tokens = min(len(seq), seq.num_computed_tokens + scheduled_seq.token_chunk_size)
+            if reached_sequence_end:
+                self.waiting.remove(seq)
+                seq.status = SequenceStatus.RUNNING
+                self.running.append(seq)
             else:
-                seq.num_computed_tokens += 1
+                self._append_waiting(seq)
+                continue
             assert token_id is not None
             seq.append_token(token_id)
             if (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens == seq.max_tokens:

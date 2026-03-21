@@ -8,7 +8,15 @@ Performance Results:
 | --- | ---: | ---: | ---: |
 | vllm | 133,966 | 12.79 | 10473.98 |
 | nano-vllm | 133,966 | 13.75 | 9740.91 |
-| hilda-vllm | 133,966 | 13.09 | 10231.27 |
+| hilda-vllm | 133,966 | 12.99 | 10311.53 |
+
+## Decode Jitter
+
+Mixed long-prefill + short-decode benchmark:
+
+| Inference Engine | Mixed Decode P50 (ms) | Mixed Decode P95 (ms) | Mixed Decode Max (ms) | Mixed Decode Steps |
+| --- | ---: | ---: | ---: | ---: |
+| hilda-vllm | 134.30 | 233.51 | 244.53 | 2 |
 
 ## Commands
 
@@ -16,6 +24,7 @@ Performance Results:
 PYTHONPATH=. python benchmarks/bench.py --backend vllm --model /root/huggingface/Qwen3-0.6B --engine-name vllm
 PYTHONPATH=. python benchmarks/bench.py --backend nano-vllm --model /root/huggingface/Qwen3-0.6B --engine-name nano-vllm
 PYTHONPATH=. python benchmarks/bench.py --backend hilda-vllm --model /root/huggingface/Qwen3-0.6B --engine-name hilda-vllm
+PYTHONPATH=. python benchmarks/bench_decode_jitter.py --model /root/huggingface/Qwen3-0.6B --engine-name hilda-vllm
 ```
 
 ## Next

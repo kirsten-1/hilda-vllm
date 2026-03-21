@@ -206,21 +206,33 @@ class ModelRunner:
         return self.model.compute_logits(graph_vars["outputs"][:bs])
 
     def run(self, scheduled_seqs: list[ScheduledSequence], is_prefill: bool) -> list[int | None]:
+        if is_prefill:
+            seqs = [scheduled_seq.seq for scheduled_seq in scheduled_seqs]
+            input_ids, positions = self.prepare_prefill(scheduled_seqs)
+            logits = self.run_model(input_ids, positions, True)
+            if self.rank == 0:
+                sample_indices = [
+                    i for i, scheduled_seq in enumerate(scheduled_seqs)
+                    if scheduled_seq.requires_sampling
+                ]
+                token_ids = [None] * len(scheduled_seqs)
+                if sample_indices:
+                    sample_logits = logits[sample_indices]
+                    temperatures = self.prepare_sample([seqs[i] for i in sample_indices])
+                    sampled_token_ids = self.sampler(sample_logits, temperatures).tolist()
+                    for i, token_id in zip(sample_indices, sampled_token_ids):
+                        token_ids[i] = token_id
+            else:
+                token_ids = None
+            reset_context()
+            return token_ids
+
         seqs = [scheduled_seq.seq for scheduled_seq in scheduled_seqs]
-        input_ids, positions = self.prepare_prefill(scheduled_seqs) if is_prefill else self.prepare_decode(seqs)
-        logits = self.run_model(input_ids, positions, is_prefill)
+        input_ids, positions = self.prepare_decode(seqs)
+        logits = self.run_model(input_ids, positions, False)
         if self.rank == 0:
-            sample_indices = [
-                i for i, scheduled_seq in enumerate(scheduled_seqs)
-                if (not is_prefill) or scheduled_seq.requires_sampling
-            ]
-            token_ids = [None] * len(scheduled_seqs)
-            if sample_indices:
-                sample_logits = logits[sample_indices]
-                temperatures = self.prepare_sample([seqs[i] for i in sample_indices])
-                sampled_token_ids = self.sampler(sample_logits, temperatures).tolist()
-                for i, token_id in zip(sample_indices, sampled_token_ids):
-                    token_ids[i] = token_id
+            temperatures = self.prepare_sample(seqs)
+            token_ids = self.sampler(logits, temperatures).tolist()
         else:
             token_ids = None
         reset_context()

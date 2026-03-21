@@ -170,9 +170,9 @@ def main():
     print_summary(result)
     save_results(result, Path(args.output_dir))
 
-    from benchmarks.render_readme import build_readme, load_latest_results, README_PATH
+    from benchmarks.render_readme import build_readme, load_latest_results, load_latest_decode_jitter_results, README_PATH
 
-    README_PATH.write_text(build_readme(load_latest_results()))
+    README_PATH.write_text(build_readme(load_latest_results(), load_latest_decode_jitter_results()))
     print(f"Updated {README_PATH}")
 
 

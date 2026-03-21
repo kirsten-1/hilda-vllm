@@ -79,7 +79,7 @@ curl -N http://127.0.0.1:8000/v1/chat/completions \
   }'
 ```
 
-Current `stream=true` output is OpenAI-compatible SSE, but it is still buffered behind the current synchronous `LLM.generate()` path.
+Current `stream=true` output is OpenAI-compatible SSE with real step-level incremental chunks. The first chunk still arrives after prompt prefill finishes.
 
 ## Next
 

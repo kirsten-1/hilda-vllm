@@ -3,6 +3,7 @@ import time
 import uuid
 from collections.abc import AsyncIterator
 from pathlib import Path
+import threading
 from typing import Any
 
 from mini_vllm import LLM, SamplingParams
@@ -76,33 +77,35 @@ class EngineAdapter:
     async def stream_completion(self, request: CompletionRequest) -> AsyncIterator[dict[str, Any]]:
         self._validate_request(request.model, request.n)
         prompts = [request.prompt] if isinstance(request.prompt, str) else request.prompt
-        outputs = await self._generate(
-            prompts,
-            self._sampling_params(request.temperature, request.max_tokens),
-        )
+        sampling_params = self._sampling_params(request.temperature, request.max_tokens)
         created = int(time.time())
         completion_id = f"cmpl-{uuid.uuid4().hex}"
-        for i, output in enumerate(outputs):
-            yield {
-                "id": completion_id,
-                "object": "text_completion",
-                "created": created,
-                "model": self.model_name,
-                "choices": [{"index": i, "text": output["text"], "finish_reason": None}],
-            }
-            yield {
-                "id": completion_id,
-                "object": "text_completion",
-                "created": created,
-                "model": self.model_name,
-                "choices": [
-                    {
-                        "index": i,
-                        "text": "",
-                        "finish_reason": self._finish_reason(output["token_ids"], request.max_tokens),
-                    }
-                ],
-            }
+        states = [self._new_text_state() for _ in prompts]
+        async for event in self._generate_stream(prompts, sampling_params):
+            request_index = event["request_index"]
+            delta_text = self._append_text_delta(states[request_index], event["token_ids"])
+            if delta_text:
+                yield {
+                    "id": completion_id,
+                    "object": "text_completion",
+                    "created": created,
+                    "model": self.model_name,
+                    "choices": [{"index": request_index, "text": delta_text, "finish_reason": None}],
+                }
+            if event["is_finished"]:
+                yield {
+                    "id": completion_id,
+                    "object": "text_completion",
+                    "created": created,
+                    "model": self.model_name,
+                    "choices": [
+                        {
+                            "index": request_index,
+                            "text": "",
+                            "finish_reason": self._finish_reason(states[request_index]["token_ids"], request.max_tokens),
+                        }
+                    ],
+                }
 
     async def create_chat_completion(self, request: ChatCompletionRequest) -> ChatCompletionResponse:
         self._validate_request(request.model, request.n)
@@ -130,14 +133,10 @@ class EngineAdapter:
     async def stream_chat_completion(self, request: ChatCompletionRequest) -> AsyncIterator[dict[str, Any]]:
         self._validate_request(request.model, request.n)
         prompt = self._build_chat_prompt(request.messages)
-        output = (
-            await self._generate(
-                [prompt],
-                self._sampling_params(request.temperature, request.max_tokens),
-            )
-        )[0]
+        sampling_params = self._sampling_params(request.temperature, request.max_tokens)
         created = int(time.time())
         completion_id = f"chatcmpl-{uuid.uuid4().hex}"
+        state = self._new_text_state()
         yield {
             "id": completion_id,
             "object": "chat.completion.chunk",
@@ -145,27 +144,30 @@ class EngineAdapter:
             "model": self.model_name,
             "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}],
         }
-        if output["text"]:
-            yield {
-                "id": completion_id,
-                "object": "chat.completion.chunk",
-                "created": created,
-                "model": self.model_name,
-                "choices": [{"index": 0, "delta": {"content": output["text"]}, "finish_reason": None}],
-            }
-        yield {
-            "id": completion_id,
-            "object": "chat.completion.chunk",
-            "created": created,
-            "model": self.model_name,
-            "choices": [
-                {
-                    "index": 0,
-                    "delta": {},
-                    "finish_reason": self._finish_reason(output["token_ids"], request.max_tokens),
+        async for event in self._generate_stream([prompt], sampling_params):
+            delta_text = self._append_text_delta(state, event["token_ids"])
+            if delta_text:
+                yield {
+                    "id": completion_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": self.model_name,
+                    "choices": [{"index": 0, "delta": {"content": delta_text}, "finish_reason": None}],
                 }
-            ],
-        }
+            if event["is_finished"]:
+                yield {
+                    "id": completion_id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": self.model_name,
+                    "choices": [
+                        {
+                            "index": 0,
+                            "delta": {},
+                            "finish_reason": self._finish_reason(state["token_ids"], request.max_tokens),
+                        }
+                    ],
+                }
 
     def close(self):
         if hasattr(self.llm, "exit"):
@@ -179,6 +181,37 @@ class EngineAdapter:
                 sampling_params,
                 False,
             )
+
+    async def _generate_stream(self, prompts: list[str], sampling_params: SamplingParams) -> AsyncIterator[dict[str, Any]]:
+        loop = asyncio.get_running_loop()
+        queue: asyncio.Queue = asyncio.Queue()
+        sentinel = object()
+
+        def push(item):
+            loop.call_soon_threadsafe(queue.put_nowait, item)
+
+        def worker():
+            try:
+                for event in self.llm.generate_stream(prompts, sampling_params):
+                    push(event)
+            except Exception as exc:  # pragma: no cover - surfaced in async consumer
+                push(exc)
+            finally:
+                push(sentinel)
+
+        async with self._lock:
+            thread = threading.Thread(target=worker, daemon=True)
+            thread.start()
+            try:
+                while True:
+                    item = await queue.get()
+                    if item is sentinel:
+                        break
+                    if isinstance(item, Exception):
+                        raise item
+                    yield item
+            finally:
+                await asyncio.to_thread(thread.join)
 
     def _build_chat_prompt(self, messages) -> str:
         rendered_messages = [
@@ -213,6 +246,17 @@ class EngineAdapter:
             completion_tokens=completion_tokens,
             total_tokens=prompt_tokens + completion_tokens,
         )
+
+    def _new_text_state(self) -> dict[str, Any]:
+        return {"token_ids": [], "text": ""}
+
+    def _append_text_delta(self, state: dict[str, Any], token_ids: list[int]) -> str:
+        state["token_ids"].extend(token_ids)
+        full_text = self.llm.tokenizer.decode(state["token_ids"])
+        previous_text = state["text"]
+        delta_text = full_text[len(previous_text):] if full_text.startswith(previous_text) else full_text
+        state["text"] = full_text
+        return delta_text
 
     @staticmethod
     def _finish_reason(token_ids: list[int], max_tokens: int) -> str:

@@ -12,6 +12,9 @@ class FakeTokenizer:
     def encode(self, text):
         return [ord(ch) for ch in text]
 
+    def decode(self, token_ids):
+        return "".join(chr(token_id) for token_id in token_ids)
+
     def apply_chat_template(self, messages, tokenize=False, add_generation_prompt=True):
         assert tokenize is False
         assert add_generation_prompt is True
@@ -24,24 +27,47 @@ class FakeLLM:
     def __init__(self):
         self.tokenizer = FakeTokenizer()
         self.calls = []
+        self.stream_calls = []
 
     def generate(self, prompts, sampling_params, use_tqdm=False):
         self.calls.append((prompts, sampling_params, use_tqdm))
         return [
             {
                 "text": f"reply:{index}",
-                "token_ids": [10 + index, 20 + index],
+                "token_ids": [ord(ch) for ch in f"reply:{index}"],
             }
             for index, _prompt in enumerate(prompts)
         ]
+
+    def generate_stream(self, prompts, sampling_params):
+        self.stream_calls.append((prompts, sampling_params))
+        for index, _prompt in enumerate(prompts):
+            text = f"reply:{index}"
+            token_ids = [ord(ch) for ch in text]
+            split = max(1, len(token_ids) // 2)
+            yield {
+                "request_index": index,
+                "seq_id": index,
+                "token_ids": token_ids[:split],
+                "completion_token_ids": token_ids[:split],
+                "is_finished": False,
+            }
+            yield {
+                "request_index": index,
+                "seq_id": index,
+                "token_ids": token_ids[split:],
+                "completion_token_ids": token_ids,
+                "is_finished": True,
+            }
 
     def exit(self):
         return None
 
 
 def make_client():
-    adapter = EngineAdapter(llm=FakeLLM(), model_name="Qwen3-0.6B")
-    return TestClient(create_app(adapter))
+    llm = FakeLLM()
+    adapter = EngineAdapter(llm=llm, model_name="Qwen3-0.6B")
+    return TestClient(create_app(adapter)), llm
 
 
 def _collect_sse_lines(response):
@@ -56,7 +82,7 @@ def _collect_sse_lines(response):
 
 
 def test_models_endpoint_returns_served_model():
-    client = make_client()
+    client, _ = make_client()
 
     response = client.get("/v1/models")
 
@@ -67,7 +93,7 @@ def test_models_endpoint_returns_served_model():
 
 
 def test_completions_endpoint_returns_openai_shape():
-    client = make_client()
+    client, llm = make_client()
 
     response = client.post(
         "/v1/completions",
@@ -83,12 +109,14 @@ def test_completions_endpoint_returns_openai_shape():
     payload = response.json()
     assert payload["object"] == "text_completion"
     assert [choice["text"] for choice in payload["choices"]] == ["reply:0", "reply:1"]
-    assert payload["usage"]["completion_tokens"] == 4
+    assert payload["usage"]["completion_tokens"] == len("reply:0") + len("reply:1")
     assert payload["usage"]["prompt_tokens"] == 4
+    assert llm.calls
+    assert not llm.stream_calls
 
 
 def test_chat_completions_endpoint_uses_chat_prompt_and_returns_message():
-    client = make_client()
+    client, llm = make_client()
 
     response = client.post(
         "/v1/chat/completions",
@@ -107,10 +135,11 @@ def test_chat_completions_endpoint_uses_chat_prompt_and_returns_message():
     assert payload["object"] == "chat.completion"
     assert payload["choices"][0]["message"]["role"] == "assistant"
     assert payload["choices"][0]["message"]["content"] == "reply:0"
+    assert llm.calls
 
 
-def test_chat_completions_stream_returns_sse_chunks():
-    client = make_client()
+def test_chat_completions_stream_returns_incremental_sse_chunks():
+    client, llm = make_client()
 
     with client.stream(
         "POST",
@@ -129,14 +158,16 @@ def test_chat_completions_stream_returns_sse_chunks():
     first = json.loads(lines[0][6:])
     second = json.loads(lines[1][6:])
     third = json.loads(lines[2][6:])
+    fourth = json.loads(lines[3][6:])
     assert first["object"] == "chat.completion.chunk"
     assert first["choices"][0]["delta"]["role"] == "assistant"
-    assert second["choices"][0]["delta"]["content"] == "reply:0"
-    assert third["choices"][0]["finish_reason"] == "stop"
+    assert second["choices"][0]["delta"]["content"] + third["choices"][0]["delta"]["content"] == "reply:0"
+    assert fourth["choices"][0]["finish_reason"] == "stop"
+    assert llm.stream_calls
 
 
 def test_streaming_unknown_model_returns_bad_request():
-    client = make_client()
+    client, _ = make_client()
 
     response = client.post(
         "/v1/chat/completions",

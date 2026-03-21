@@ -148,6 +148,38 @@ class LLMEngine:
     def is_finished(self):
         return self.scheduler.is_finished()
 
+    def generate_stream(
+        self,
+        prompts: list[str] | list[list[int]],
+        sampling_params: SamplingParams | list[SamplingParams],
+    ):
+        seqs = self._add_sequences(prompts, sampling_params)
+        emitted_completion_tokens = {seq.seq_id: 0 for seq in seqs}
+        request_indices = {seq.seq_id: index for index, seq in enumerate(seqs)}
+        stats = self._init_generate_stats(seqs)
+        total_start = perf_counter()
+        while not self.is_finished():
+            t = perf_counter()
+            _, num_prefill_tokens, num_decode_tokens = self.step()
+            elapsed = perf_counter() - t
+            self._update_generate_stats(stats, num_prefill_tokens, num_decode_tokens, elapsed)
+            for seq in seqs:
+                completion_token_ids = seq.completion_token_ids
+                previous_count = emitted_completion_tokens[seq.seq_id]
+                if len(completion_token_ids) <= previous_count:
+                    continue
+                new_token_ids = completion_token_ids[previous_count:]
+                emitted_completion_tokens[seq.seq_id] = len(completion_token_ids)
+                yield {
+                    "request_index": request_indices[seq.seq_id],
+                    "seq_id": seq.seq_id,
+                    "token_ids": list(new_token_ids),
+                    "completion_token_ids": list(completion_token_ids),
+                    "is_finished": seq.is_finished,
+                }
+        total_time = perf_counter() - total_start
+        self._set_last_generate_stats(stats, total_time)
+
     def generate(
         self,
         prompts: list[str] | list[list[int]],
@@ -156,29 +188,15 @@ class LLMEngine:
     ) -> list[str]:
         if use_tqdm:
             pbar = tqdm(total=len(prompts), desc="Generating", dynamic_ncols=True)
-        if not isinstance(sampling_params, list):
-            sampling_params = [sampling_params] * len(prompts)
-        seqs = []
-        for prompt, sp in zip(prompts, sampling_params):
-            seqs.append(self.add_request(prompt, sp))
+        seqs = self._add_sequences(prompts, sampling_params)
         outputs = {}
-        total_prompt_tokens = sum(seq.num_prompt_tokens for seq in seqs)
-        prefill_throughput = decode_throughput = 0.0
-        prefill_tokens = decode_tokens = 0
-        prefill_time = decode_time = 0.0
+        stats = self._init_generate_stats(seqs)
         total_start = perf_counter()
         while not self.is_finished():
             t = perf_counter()
             output, num_prefill_tokens, num_decode_tokens = self.step()
             elapsed = perf_counter() - t
-            if num_prefill_tokens > 0:
-                prefill_tokens += num_prefill_tokens
-                prefill_time += elapsed
-                prefill_throughput = num_prefill_tokens / elapsed if elapsed else 0.0
-            if num_decode_tokens > 0:
-                decode_tokens += num_decode_tokens
-                decode_time += elapsed
-                decode_throughput = num_decode_tokens / elapsed if elapsed else 0.0
+            prefill_throughput, decode_throughput = self._update_generate_stats(stats, num_prefill_tokens, num_decode_tokens, elapsed)
             if use_tqdm:
                 pbar.set_postfix({
                     "Prefill": f"{int(prefill_throughput)}tok/s",
@@ -189,22 +207,62 @@ class LLMEngine:
                 if use_tqdm:
                     pbar.update(1)
         total_time = perf_counter() - total_start
-        outputs = [outputs[seq_id] for seq_id in sorted(outputs.keys())]
+        self._set_last_generate_stats(stats, total_time)
+        outputs = [outputs[seq.seq_id] for seq in seqs]
         outputs = [{"text": self.tokenizer.decode(token_ids), "token_ids": token_ids} for token_ids in outputs]
-        total_output_tokens = sum(len(output["token_ids"]) for output in outputs)
-        self.last_generate_stats = {
-            "num_requests": len(prompts),
-            "prompt_tokens": total_prompt_tokens,
-            "output_tokens": total_output_tokens,
-            "prefill_tokens": prefill_tokens,
-            "decode_tokens": decode_tokens,
-            "prefill_time_s": prefill_time,
-            "decode_time_s": decode_time,
-            "total_time_s": total_time,
-            "prefill_throughput_toks": prefill_tokens / prefill_time if prefill_time else 0.0,
-            "decode_throughput_toks": decode_tokens / decode_time if decode_time else 0.0,
-            "total_throughput_toks": total_output_tokens / total_time if total_time else 0.0,
-        }
         if use_tqdm:
             pbar.close()
         return outputs
+
+    def _add_sequences(
+        self,
+        prompts: list[str] | list[list[int]],
+        sampling_params: SamplingParams | list[SamplingParams],
+    ) -> list[Sequence]:
+        if not isinstance(sampling_params, list):
+            sampling_params = [sampling_params] * len(prompts)
+        seqs = []
+        for prompt, sp in zip(prompts, sampling_params):
+            seqs.append(self.add_request(prompt, sp))
+        return seqs
+
+    @staticmethod
+    def _init_generate_stats(seqs: list[Sequence]) -> dict:
+        return {
+            "num_requests": len(seqs),
+            "prompt_tokens": sum(seq.num_prompt_tokens for seq in seqs),
+            "prefill_tokens": 0,
+            "decode_tokens": 0,
+            "prefill_time_s": 0.0,
+            "decode_time_s": 0.0,
+        }
+
+    @staticmethod
+    def _update_generate_stats(stats: dict, num_prefill_tokens: int, num_decode_tokens: int, elapsed: float) -> tuple[float, float]:
+        prefill_throughput = 0.0
+        decode_throughput = 0.0
+        if num_prefill_tokens > 0:
+            stats["prefill_tokens"] += num_prefill_tokens
+            stats["prefill_time_s"] += elapsed
+            prefill_throughput = num_prefill_tokens / elapsed if elapsed else 0.0
+        if num_decode_tokens > 0:
+            stats["decode_tokens"] += num_decode_tokens
+            stats["decode_time_s"] += elapsed
+            decode_throughput = num_decode_tokens / elapsed if elapsed else 0.0
+        return prefill_throughput, decode_throughput
+
+    def _set_last_generate_stats(self, stats: dict, total_time: float):
+        total_output_tokens = stats["decode_tokens"]
+        self.last_generate_stats = {
+            "num_requests": stats["num_requests"],
+            "prompt_tokens": stats["prompt_tokens"],
+            "output_tokens": total_output_tokens,
+            "prefill_tokens": stats["prefill_tokens"],
+            "decode_tokens": stats["decode_tokens"],
+            "prefill_time_s": stats["prefill_time_s"],
+            "decode_time_s": stats["decode_time_s"],
+            "total_time_s": total_time,
+            "prefill_throughput_toks": stats["prefill_tokens"] / stats["prefill_time_s"] if stats["prefill_time_s"] else 0.0,
+            "decode_throughput_toks": stats["decode_tokens"] / stats["decode_time_s"] if stats["decode_time_s"] else 0.0,
+            "total_throughput_toks": total_output_tokens / total_time if total_time else 0.0,
+        }

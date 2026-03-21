@@ -1,7 +1,5 @@
 import itertools
 import pickle
-from collections import deque
-
 import pytest
 
 from mini_vllm.engine.scheduler import Scheduler

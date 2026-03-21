@@ -23,6 +23,7 @@ class ModelRunner:
         self.world_size = config.tensor_parallel_size
         self.rank = rank
         self.event = event
+        self.use_fp8_kv_cache = config.kv_cache_dtype == "fp8"
 
         dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
         torch.cuda.set_device(rank)
@@ -107,16 +108,78 @@ class ModelRunner:
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
         num_kv_heads = hf_config.num_key_value_heads // self.world_size
         head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
-        block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.torch_dtype.itemsize
+        prefill_dtype = hf_config.torch_dtype
+        decode_dtype = torch.float8_e4m3fn
+        if self.use_fp8_kv_cache:
+            assert prefill_dtype == torch.bfloat16, "FP8 KV cache currently requires BF16 model weights"
+            assert head_dim == 128, "FP8 KV cache currently requires head_dim=128"
+            block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * (
+                torch.empty((), dtype=prefill_dtype).element_size() + torch.empty((), dtype=decode_dtype).element_size()
+            )
+        else:
+            block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * torch.empty((), dtype=prefill_dtype).element_size()
         config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
         assert config.num_kvcache_blocks > 0
-        self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
+
+        if self.use_fp8_kv_cache:
+            self.prefill_kv_cache = torch.empty(
+                2,
+                hf_config.num_hidden_layers,
+                config.num_kvcache_blocks,
+                self.block_size,
+                num_kv_heads,
+                head_dim,
+                dtype=prefill_dtype,
+            )
+            self.decode_kv_cache = torch.empty(
+                2,
+                hf_config.num_hidden_layers,
+                config.num_kvcache_blocks,
+                self.block_size,
+                num_kv_heads,
+                head_dim,
+                dtype=decode_dtype,
+            )
+        else:
+            self.kv_cache = torch.empty(
+                2,
+                hf_config.num_hidden_layers,
+                config.num_kvcache_blocks,
+                self.block_size,
+                num_kv_heads,
+                head_dim,
+                dtype=prefill_dtype,
+            )
+
         layer_id = 0
         for module in self.model.modules():
             if hasattr(module, "k_cache") and hasattr(module, "v_cache"):
-                module.k_cache = self.kv_cache[0, layer_id]
-                module.v_cache = self.kv_cache[1, layer_id]
+                module.kv_cache_dtype = config.kv_cache_dtype
+                if self.use_fp8_kv_cache:
+                    module.prefill_k_cache = self.prefill_kv_cache[0, layer_id]
+                    module.prefill_v_cache = self.prefill_kv_cache[1, layer_id]
+                    module.decode_k_cache = self.decode_kv_cache[0, layer_id]
+                    module.decode_v_cache = self.decode_kv_cache[1, layer_id]
+                    module.k_cache = module.prefill_k_cache
+                    module.v_cache = module.prefill_v_cache
+                else:
+                    module.k_cache = self.kv_cache[0, layer_id]
+                    module.v_cache = self.kv_cache[1, layer_id]
                 layer_id += 1
+
+    @torch.inference_mode()
+    def convert_prefill_to_decode_cache(self, seqs: list[Sequence]):
+        if not self.use_fp8_kv_cache or not seqs:
+            return
+        block_ids = []
+        for seq in seqs:
+            num_prompt_blocks = (seq.num_prompt_tokens + self.block_size - 1) // self.block_size
+            block_ids.extend(seq.block_table[:num_prompt_blocks])
+        if not block_ids:
+            return
+        block_ids = list(dict.fromkeys(block_ids))
+        for block_id in block_ids:
+            self.decode_kv_cache[:, :, block_id].copy_(self.prefill_kv_cache[:, :, block_id].to(dtype=self.decode_kv_cache.dtype))
 
     def prepare_block_tables(self, seqs: list[Sequence]):
         max_len = max(len(seq.block_table) for seq in seqs)

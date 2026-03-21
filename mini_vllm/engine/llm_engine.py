@@ -19,6 +19,7 @@ class LLMEngine:
         config_fields = {field.name for field in fields(Config)}
         config_kwargs = {k: v for k, v in kwargs.items() if k in config_fields}
         config = Config(model, **config_kwargs)
+        self.config = config
         self.ps = []
         self.events = []
         ctx = mp.get_context("spawn")
@@ -54,6 +55,10 @@ class LLMEngine:
         seqs, is_prefill = self.scheduler.schedule()
         token_ids = self.model_runner.call("run", seqs, is_prefill)
         self.scheduler.postprocess(seqs, token_ids, is_prefill)
+        if is_prefill and self.config.kv_cache_dtype == "fp8":
+            for scheduled_seq in seqs:
+                if scheduled_seq.seq.is_prefill_done and not scheduled_seq.seq.is_finished:
+                    scheduled_seq.seq.decode_cache_ready = True
         outputs = [(scheduled_seq.seq.seq_id, scheduled_seq.seq.completion_token_ids) for scheduled_seq in seqs if scheduled_seq.seq.is_finished]
         num_prefill_tokens = sum(scheduled_seq.token_chunk_size for scheduled_seq in seqs) if is_prefill else 0
         num_decode_tokens = sum(token_id is not None for token_id in token_ids) if is_prefill else len(token_ids)

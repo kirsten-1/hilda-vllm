@@ -21,6 +21,7 @@ def parse_args():
     parser.add_argument("--num-short-seqs", type=int, default=256)
     parser.add_argument("--short-output-len", type=int, default=128)
     parser.add_argument("--max-num-batched-tokens", type=int, default=8192)
+    parser.add_argument("--kv-cache-dtype", choices=("auto", "fp8"), default="auto")
     return parser.parse_args()
 
 
@@ -103,6 +104,7 @@ def main():
         enforce_eager=False,
         max_model_len=args.long_prompt_len + 256,
         max_num_batched_tokens=args.max_num_batched_tokens,
+        kv_cache_dtype=args.kv_cache_dtype,
     )
     llm.generate(["Benchmark: "], SamplingParams(), use_tqdm=False)
 

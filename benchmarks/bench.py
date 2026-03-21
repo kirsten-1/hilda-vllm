@@ -22,6 +22,7 @@ def parse_args():
     parser.add_argument("--model", default=os.path.expanduser("~/huggingface/Qwen3-0.6B/"))
     parser.add_argument("--engine-name", default=None)
     parser.add_argument("--output-dir", default="benchmarks/results")
+    parser.add_argument("--kv-cache-dtype", choices=("auto", "fp8"), default="auto")
     return parser.parse_args()
 
 
@@ -156,6 +157,8 @@ def main():
     LLM, SamplingParams = load_backend(args.backend)
     path = os.path.expanduser(args.model)
     llm_kwargs = {"enforce_eager": False, "max_model_len": 4096}
+    if args.backend == "hilda-vllm":
+        llm_kwargs["kv_cache_dtype"] = args.kv_cache_dtype
     llm = LLM(path, **llm_kwargs)
 
     prompt_token_ids = [[randint(0, 10000) for _ in range(randint(100, max_input_len))] for _ in range(num_seqs)]

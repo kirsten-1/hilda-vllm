@@ -88,6 +88,7 @@ class BlockManager:
             if block.ref_count == 0:
                 self._deallocate_block(block_id)
         seq.num_cached_tokens = 0
+        seq.decode_cache_ready = False
         seq.block_table.clear()
 
     def can_append(self, seq: Sequence) -> bool:

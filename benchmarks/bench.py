@@ -66,7 +66,6 @@ def print_summary(result: dict):
     print(render(row))
 
 
-
 def save_results(result: dict, output_dir: Path):
     output_dir.mkdir(parents=True, exist_ok=True)
     timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
@@ -102,11 +101,9 @@ def save_results(result: dict, output_dir: Path):
     print(f"Appended summary row to {csv_path}")
 
 
-
 def load_backend(backend: str):
     module = importlib.import_module(BACKENDS[backend])
     return module.LLM, module.SamplingParams
-
 
 
 def prepare_prompts(prompt_token_ids: list[list[int]], backend: str):
@@ -115,12 +112,10 @@ def prepare_prompts(prompt_token_ids: list[list[int]], backend: str):
     return prompt_token_ids
 
 
-
 def count_output_tokens(outputs, backend: str):
     if backend == "vllm":
         return sum(len(completion.token_ids) for request in outputs for completion in request.outputs)
     return sum(len(output["token_ids"]) for output in outputs)
-
 
 
 def build_result(args, llm, outputs, prompt_token_ids, total_time_s: float):
@@ -144,7 +139,6 @@ def build_result(args, llm, outputs, prompt_token_ids, total_time_s: float):
     if getattr(llm, "last_generate_stats", None):
         result.update(llm.last_generate_stats)
     return result
-
 
 
 def main():
@@ -173,9 +167,21 @@ def main():
     print_summary(result)
     save_results(result, Path(args.output_dir))
 
-    from benchmarks.render_readme import build_readme, load_latest_results, load_latest_decode_jitter_results, README_PATH
+    from benchmarks.render_readme import (
+        README_PATH,
+        build_readme,
+        load_latest_decode_heavy_results,
+        load_latest_decode_jitter_results,
+        load_latest_results,
+    )
 
-    README_PATH.write_text(build_readme(load_latest_results(), load_latest_decode_jitter_results()))
+    README_PATH.write_text(
+        build_readme(
+            load_latest_results(),
+            load_latest_decode_jitter_results(),
+            load_latest_decode_heavy_results(),
+        )
+    )
     print(f"Updated {README_PATH}")
 
 

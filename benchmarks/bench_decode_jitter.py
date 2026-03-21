@@ -92,8 +92,16 @@ def print_summary(result: dict):
     print("Decode Jitter Results:")
     print(f"Engine: {result['engine']}")
     print(f"Mixed decode steps: {result['mixed_decode_steps']}")
-    print(f"Mixed decode p50/p95/max (ms): {result['mixed_decode_latency_p50_ms']:.2f} / {result['mixed_decode_latency_p95_ms']:.2f} / {result['mixed_decode_latency_max_ms']:.2f}" if result['mixed_decode_steps'] else "Mixed decode p50/p95/max (ms): n/a")
-    print(f"All decode p50/p95/max (ms): {result['decode_latency_p50_ms']:.2f} / {result['decode_latency_p95_ms']:.2f} / {result['decode_latency_max_ms']:.2f}" if result['decode_steps'] else "All decode p50/p95/max (ms): n/a")
+    print(
+        f"Mixed decode p50/p95/max (ms): {result['mixed_decode_latency_p50_ms']:.2f} / {result['mixed_decode_latency_p95_ms']:.2f} / {result['mixed_decode_latency_max_ms']:.2f}"
+        if result['mixed_decode_steps']
+        else "Mixed decode p50/p95/max (ms): n/a"
+    )
+    print(
+        f"All decode p50/p95/max (ms): {result['decode_latency_p50_ms']:.2f} / {result['decode_latency_p95_ms']:.2f} / {result['decode_latency_max_ms']:.2f}"
+        if result['decode_steps']
+        else "All decode p50/p95/max (ms): n/a"
+    )
 
 
 def main():
@@ -140,9 +148,21 @@ def main():
     print_summary(result)
     save_results(result, Path(args.output_dir))
 
-    from benchmarks.render_readme import build_readme, load_latest_results, load_latest_decode_jitter_results, README_PATH
+    from benchmarks.render_readme import (
+        README_PATH,
+        build_readme,
+        load_latest_decode_heavy_results,
+        load_latest_decode_jitter_results,
+        load_latest_results,
+    )
 
-    README_PATH.write_text(build_readme(load_latest_results(), load_latest_decode_jitter_results()))
+    README_PATH.write_text(
+        build_readme(
+            load_latest_results(),
+            load_latest_decode_jitter_results(),
+            load_latest_decode_heavy_results(),
+        )
+    )
     print(f"Updated {README_PATH}")
     llm.exit()
 

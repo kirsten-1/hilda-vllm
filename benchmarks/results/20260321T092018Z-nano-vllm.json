@@ -1,0 +1,17 @@
+{
+  "timestamp": "2026-03-21T09:20:18.846014+00:00",
+  "engine": "nano-vllm",
+  "backend": "nano-vllm",
+  "model": "/root/huggingface/Qwen3-0.6B",
+  "num_requests": 256,
+  "prompt_tokens": 142827,
+  "output_tokens": 133966,
+  "prefill_tokens": null,
+  "decode_tokens": null,
+  "prefill_time_s": null,
+  "decode_time_s": null,
+  "total_time_s": 13.752931182971224,
+  "prefill_throughput_toks": null,
+  "decode_throughput_toks": null,
+  "total_throughput_toks": 9740.905281768275
+}

@@ -23,6 +23,7 @@ class Sequence:
         self.num_tokens = len(self.token_ids)
         self.num_prompt_tokens = len(token_ids)
         self.num_cached_tokens = 0
+        self.num_computed_tokens = 0
         self.block_table = []
         self.temperature = sampling_params.temperature
         self.max_tokens = sampling_params.max_tokens
@@ -43,12 +44,24 @@ class Sequence:
         return self.num_tokens - self.num_prompt_tokens
 
     @property
+    def num_uncomputed_tokens(self):
+        return self.num_tokens - self.num_computed_tokens
+
+    @property
     def prompt_token_ids(self):
         return self.token_ids[:self.num_prompt_tokens]
 
     @property
     def completion_token_ids(self):
         return self.token_ids[self.num_prompt_tokens:]
+
+    @property
+    def num_prompt_tokens_remaining(self):
+        return max(0, self.num_prompt_tokens - self.num_computed_tokens)
+
+    @property
+    def is_prefill_done(self):
+        return self.num_computed_tokens >= self.num_prompt_tokens
 
     @property
     def num_cached_blocks(self):
@@ -72,12 +85,21 @@ class Sequence:
         self.num_tokens += 1
 
     def __getstate__(self):
-        return (self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.block_table,
-                self.token_ids if self.num_completion_tokens == 0 else self.last_token)
+        token_state = self.token_ids if self.status == SequenceStatus.WAITING or self.num_completion_tokens == 0 else self.last_token
+        return (
+            self.status,
+            self.num_tokens,
+            self.num_prompt_tokens,
+            self.num_cached_tokens,
+            self.num_computed_tokens,
+            self.block_table,
+            token_state,
+        )
 
     def __setstate__(self, state):
-        self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.block_table = state[:-1]
-        if self.num_completion_tokens == 0:
+        self.status, self.num_tokens, self.num_prompt_tokens, self.num_cached_tokens, self.num_computed_tokens, self.block_table = state[:-1]
+        if self.status == SequenceStatus.WAITING or self.num_completion_tokens == 0:
             self.token_ids = state[-1]
+            self.last_token = self.token_ids[-1]
         else:
             self.last_token = state[-1]

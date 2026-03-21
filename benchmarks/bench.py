@@ -1,31 +1,179 @@
+import argparse
+import csv
+import importlib
+import json
 import os
-import time
+from datetime import UTC, datetime
+from pathlib import Path
 from random import randint, seed
-from mini_vllm import LLM, SamplingParams
-# from vllm import LLM, SamplingParams
+from time import perf_counter
+
+
+BACKENDS = {
+    "hilda-vllm": "mini_vllm",
+    "nano-vllm": "nanovllm",
+    "vllm": "vllm",
+}
+
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--backend", choices=tuple(BACKENDS), default="hilda-vllm")
+    parser.add_argument("--model", default=os.path.expanduser("~/huggingface/Qwen3-0.6B/"))
+    parser.add_argument("--engine-name", default=None)
+    parser.add_argument("--output-dir", default="benchmarks/results")
+    return parser.parse_args()
+
+
+def format_metric(value):
+    if value is None:
+        return "n/a"
+    return f"{value:.2f}" if isinstance(value, float) else str(value)
+
+
+def print_summary(result: dict):
+    headers = [
+        "Inference Engine",
+        "Prompt Tokens",
+        "Output Tokens",
+        "Prefill (tok/s)",
+        "Decode (tok/s)",
+        "Total Throughput (tok/s)",
+        "Prefill Time (s)",
+        "Decode Time (s)",
+        "Total Time (s)",
+    ]
+    row = [
+        format_metric(result["engine"]),
+        format_metric(result["prompt_tokens"]),
+        format_metric(result["output_tokens"]),
+        format_metric(result["prefill_throughput_toks"]),
+        format_metric(result["decode_throughput_toks"]),
+        format_metric(result["total_throughput_toks"]),
+        format_metric(result["prefill_time_s"]),
+        format_metric(result["decode_time_s"]),
+        format_metric(result["total_time_s"]),
+    ]
+    widths = [max(len(header), len(value)) for header, value in zip(headers, row)]
+
+    def render(values):
+        return " | ".join(value.ljust(width) for value, width in zip(values, widths))
+
+    print("Performance Results:")
+    print(render(headers))
+    print(render(["-" * width for width in widths]))
+    print(render(row))
+
+
+
+def save_results(result: dict, output_dir: Path):
+    output_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    slug = result["engine"].replace("/", "-")
+    json_path = output_dir / f"{timestamp}-{slug}.json"
+    csv_path = output_dir / "performance_results.csv"
+    json_path.write_text(json.dumps(result, indent=2) + "\n")
+
+    fieldnames = [
+        "timestamp",
+        "engine",
+        "backend",
+        "model",
+        "num_requests",
+        "prompt_tokens",
+        "output_tokens",
+        "prefill_tokens",
+        "decode_tokens",
+        "prefill_time_s",
+        "decode_time_s",
+        "total_time_s",
+        "prefill_throughput_toks",
+        "decode_throughput_toks",
+        "total_throughput_toks",
+    ]
+    write_header = not csv_path.exists()
+    with csv_path.open("a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        if write_header:
+            writer.writeheader()
+        writer.writerow({name: result.get(name) for name in fieldnames})
+    print(f"Saved detailed results to {json_path}")
+    print(f"Appended summary row to {csv_path}")
+
+
+
+def load_backend(backend: str):
+    module = importlib.import_module(BACKENDS[backend])
+    return module.LLM, module.SamplingParams
+
+
+
+def prepare_prompts(prompt_token_ids: list[list[int]], backend: str):
+    if backend == "vllm":
+        return [{"prompt_token_ids": prompt} for prompt in prompt_token_ids]
+    return prompt_token_ids
+
+
+
+def count_output_tokens(outputs, backend: str):
+    if backend == "vllm":
+        return sum(len(completion.token_ids) for request in outputs for completion in request.outputs)
+    return sum(len(output["token_ids"]) for output in outputs)
+
+
+
+def build_result(args, llm, outputs, prompt_token_ids, total_time_s: float):
+    result = {
+        "timestamp": datetime.now(UTC).isoformat(),
+        "engine": args.engine_name or args.backend,
+        "backend": args.backend,
+        "model": os.path.expanduser(args.model),
+        "num_requests": len(prompt_token_ids),
+        "prompt_tokens": sum(len(prompt) for prompt in prompt_token_ids),
+        "output_tokens": count_output_tokens(outputs, args.backend),
+        "prefill_tokens": None,
+        "decode_tokens": None,
+        "prefill_time_s": None,
+        "decode_time_s": None,
+        "total_time_s": total_time_s,
+        "prefill_throughput_toks": None,
+        "decode_throughput_toks": None,
+        "total_throughput_toks": count_output_tokens(outputs, args.backend) / total_time_s if total_time_s else 0.0,
+    }
+    if getattr(llm, "last_generate_stats", None):
+        result.update(llm.last_generate_stats)
+    return result
+
 
 
 def main():
+    args = parse_args()
     seed(0)
     num_seqs = 256
     max_input_len = 1024
     max_ouput_len = 1024
 
-    path = os.path.expanduser("~/huggingface/Qwen3-0.6B/")
-    llm = LLM(path, enforce_eager=False, max_model_len=4096)
+    LLM, SamplingParams = load_backend(args.backend)
+    path = os.path.expanduser(args.model)
+    llm_kwargs = {"enforce_eager": False, "max_model_len": 4096}
+    llm = LLM(path, **llm_kwargs)
 
     prompt_token_ids = [[randint(0, 10000) for _ in range(randint(100, max_input_len))] for _ in range(num_seqs)]
     sampling_params = [SamplingParams(temperature=0.6, ignore_eos=True, max_tokens=randint(100, max_ouput_len)) for _ in range(num_seqs)]
-    # uncomment the following line for vllm
-    # prompt_token_ids = [dict(prompt_token_ids=p) for p in prompt_token_ids]
 
     llm.generate(["Benchmark: "], SamplingParams())
-    t = time.time()
-    llm.generate(prompt_token_ids, sampling_params, use_tqdm=False)
-    t = (time.time() - t)
-    total_tokens = sum(sp.max_tokens for sp in sampling_params)
-    throughput = total_tokens / t
-    print(f"Total: {total_tokens}tok, Time: {t:.2f}s, Throughput: {throughput:.2f}tok/s")
+    prompts = prepare_prompts(prompt_token_ids, args.backend)
+    t0 = perf_counter()
+    outputs = llm.generate(prompts, sampling_params, use_tqdm=False)
+    total_time_s = perf_counter() - t0
+    result = build_result(args, llm, outputs, prompt_token_ids, total_time_s)
+    print_summary(result)
+    save_results(result, Path(args.output_dir))
+
+    from benchmarks.render_readme import build_readme, load_latest_results, README_PATH
+
+    README_PATH.write_text(build_readme(load_latest_results()))
+    print(f"Updated {README_PATH}")
 
 
 if __name__ == "__main__":

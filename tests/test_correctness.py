@@ -33,12 +33,23 @@ def test_sequence_tracks_prompt_and_completion_tokens():
 
 def test_prompt_only_sequence_survives_pickle_roundtrip():
     seq = Sequence([7, 8, 9], SamplingParams(max_tokens=3))
+    seq.num_computed_tokens = 2
 
     restored = pickle.loads(pickle.dumps(seq))
 
     assert restored.token_ids == [7, 8, 9]
     assert restored.num_prompt_tokens == 3
     assert restored.num_completion_tokens == 0
+    assert restored.num_computed_tokens == 2
+
+
+def test_sequence_exposes_prefill_progress():
+    seq = Sequence([1, 2, 3, 4], SamplingParams(max_tokens=3))
+    seq.num_computed_tokens = 3
+
+    assert seq.num_prompt_tokens_remaining == 1
+    assert seq.num_uncomputed_tokens == 1
+    assert seq.is_prefill_done is False
 
 
 def test_sampling_params_rejects_zero_temperature():

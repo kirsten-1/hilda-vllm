@@ -1,0 +1,16 @@
+{
+  "timestamp": "2026-03-21T07:07:14.619625+00:00",
+  "engine": "hilda-vllm",
+  "model": "/root/huggingface/Qwen3-0.6B",
+  "num_requests": 256,
+  "prompt_tokens": 142827,
+  "output_tokens": 133966,
+  "prefill_tokens": 143083,
+  "decode_tokens": 133710,
+  "prefill_time_s": 0.9427462508901954,
+  "decode_time_s": 11.851155321928672,
+  "total_time_s": 12.7960924890358,
+  "prefill_throughput_toks": 151772.54734759516,
+  "decode_throughput_toks": 11282.444316006135,
+  "total_throughput_toks": 10469.289755039468
+}

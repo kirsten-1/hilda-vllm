@@ -135,6 +135,8 @@ class ModelRunner:
         head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
         prefill_dtype = hf_config.torch_dtype
         decode_dtype = torch.float8_e4m3fn
+
+        # Calculate per-block bytes for target model
         if self.use_fp8_kv_cache:
             assert prefill_dtype == torch.bfloat16, "FP8 KV cache currently requires BF16 model weights"
             assert head_dim == 128, "FP8 KV cache currently requires head_dim=128"
@@ -143,7 +145,18 @@ class ModelRunner:
             )
         else:
             block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * torch.empty((), dtype=prefill_dtype).element_size()
-        config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
+
+        # If spec decode is enabled, also account for draft KV cache per block
+        draft_block_bytes = 0
+        if self.use_spec_decode:
+            draft_hf_config = config.draft_hf_config
+            draft_num_kv_heads = draft_hf_config.num_key_value_heads // self.world_size
+            draft_head_dim = getattr(draft_hf_config, "head_dim", draft_hf_config.hidden_size // draft_hf_config.num_attention_heads)
+            draft_dtype = draft_hf_config.torch_dtype
+            draft_block_bytes = 2 * draft_hf_config.num_hidden_layers * self.block_size * draft_num_kv_heads * draft_head_dim * torch.empty((), dtype=draft_dtype).element_size()
+
+        total_block_bytes = block_bytes + draft_block_bytes
+        config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // total_block_bytes
         assert config.num_kvcache_blocks > 0
 
         if self.use_fp8_kv_cache:
@@ -269,8 +282,12 @@ class ModelRunner:
                 input_ids_list.append(last_tok)
                 context_lens_list.append(cur_len)
                 num_blocks_needed = (cur_len + self.block_size - 1) // self.block_size
+                if num_blocks_needed > len(seq.block_table):
+                    # Not enough blocks allocated; use last available block
+                    num_blocks_needed = len(seq.block_table)
                 last_block_tokens = cur_len - (num_blocks_needed - 1) * self.block_size
-                slot_mapping_list.append(seq.block_table[num_blocks_needed - 1] * self.block_size + last_block_tokens - 1)
+                slot = seq.block_table[num_blocks_needed - 1] * self.block_size + last_block_tokens - 1
+                slot_mapping_list.append(slot)
             input_ids = torch.tensor(input_ids_list, dtype=torch.int64, device="cuda")
             context_lens = torch.tensor(context_lens_list, dtype=torch.int32, device="cuda")
             positions = (context_lens - 1).to(dtype=torch.int64)
@@ -330,8 +347,12 @@ class ModelRunner:
 
             for pos in range(start_pos, start_pos + num_verify):
                 block_idx = pos // self.block_size
-                block_id = seq.block_table[block_idx]
-                all_slot_mapping.append(block_id * self.block_size + pos % self.block_size)
+                if block_idx >= len(seq.block_table):
+                    # Safety: if block not allocated, use slot -1 (will be skipped by store kernel)
+                    all_slot_mapping.append(-1)
+                else:
+                    block_id = seq.block_table[block_idx]
+                    all_slot_mapping.append(block_id * self.block_size + pos % self.block_size)
 
         input_ids = torch.tensor(all_input_ids, dtype=torch.int64, device="cuda")
         positions = torch.tensor(all_positions, dtype=torch.int64, device="cuda")

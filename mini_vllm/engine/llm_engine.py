@@ -137,7 +137,8 @@ class LLMEngine:
                                 break
 
                     # Step 5: Clean dirty KV slots from rejected draft tokens
-                    self.model_runner.call("cleanup_rejected_kv_slots", spec_eligible_seqs, verify_results, gamma)
+                    # (disabled - context_lens prevents reading dirty slots)
+                    # self.model_runner.call("cleanup_rejected_kv_slots", spec_eligible_seqs, verify_results, gamma)
 
                     # Step 6: Trim unused blocks and fix hash state for remaining sequences
                     for seq in spec_eligible_seqs:

@@ -1,3 +1,4 @@
+import heapq
 from collections import deque
 from dataclasses import dataclass, field
 
@@ -43,7 +44,7 @@ class Scheduler:
 
         # Persistent batching slots
         self.decode_slots: list[Sequence | None] = [None] * self.max_num_seqs
-        self.free_slot_indices: deque[int] = deque(range(self.max_num_seqs))
+        self.free_slot_indices: list[int] = list(range(self.max_num_seqs))
         self.persistent_batch_size: int = 0
 
     def is_finished(self):
@@ -55,7 +56,7 @@ class Scheduler:
     # --- Slot management ---
 
     def _assign_decode_slot(self, seq: Sequence):
-        slot_idx = self.free_slot_indices.popleft()
+        slot_idx = heapq.heappop(self.free_slot_indices)
         self.decode_slots[slot_idx] = seq
         seq.decode_slot_index = slot_idx
         if slot_idx + 1 > self.persistent_batch_size:
@@ -64,15 +65,28 @@ class Scheduler:
     def _free_decode_slot(self, seq: Sequence):
         slot_idx = seq.decode_slot_index
         if slot_idx >= 0:
-            self.decode_slots[slot_idx] = None
-            self.free_slot_indices.append(slot_idx)
+            last_idx = self.persistent_batch_size - 1
+            while last_idx > slot_idx and self.decode_slots[last_idx] is None:
+                last_idx -= 1
+            if last_idx > slot_idx:
+                moved_seq = self.decode_slots[last_idx]
+                assert moved_seq is not None
+                self.decode_slots[slot_idx] = moved_seq
+                moved_seq.decode_slot_index = slot_idx
+                self.decode_slots[last_idx] = None
+                heapq.heappush(self.free_slot_indices, last_idx)
+            else:
+                self.decode_slots[slot_idx] = None
+                heapq.heappush(self.free_slot_indices, slot_idx)
             seq.decode_slot_index = -1
 
     def _maybe_shrink_batch(self):
+        while self.persistent_batch_size > 0 and self.decode_slots[self.persistent_batch_size - 1] is None:
+            self.persistent_batch_size -= 1
         if not self.running:
             assert all(slot is None for slot in self.decode_slots)
             self.persistent_batch_size = 0
-            self.free_slot_indices = deque(range(self.max_num_seqs))
+            self.free_slot_indices = list(range(self.max_num_seqs))
 
     # --- Chunked prefill helpers ---
 

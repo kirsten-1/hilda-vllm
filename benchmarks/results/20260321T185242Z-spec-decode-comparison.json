@@ -1,0 +1,40 @@
+{
+  "timestamp": "20260321T185242Z",
+  "target_model": "/root/autodl-tmp",
+  "draft_model": "/root/huggingface/Qwen3-0.6B",
+  "gamma": 3,
+  "baseline": {
+    "label": "baseline",
+    "num_requests": 8,
+    "prompt_tokens": 734,
+    "output_tokens": 435,
+    "total_time_s": 1.987338813021779,
+    "total_throughput_toks": 218.88567623684452,
+    "prefill_tokens": 734,
+    "decode_tokens": 435,
+    "prefill_time_s": 0.5821752819465473,
+    "decode_time_s": 1.9870739890029654,
+    "prefill_throughput_toks": 1260.7886709752004,
+    "decode_throughput_toks": 218.91484786546155,
+    "spec_proposed": 0,
+    "spec_accepted": 0,
+    "spec_acceptance_rate": 0.0
+  },
+  "spec_decode": {
+    "label": "spec-decode-gamma3",
+    "num_requests": 8,
+    "prompt_tokens": 734,
+    "output_tokens": 435,
+    "total_time_s": 3.5206345400074497,
+    "total_throughput_toks": 123.55727214988907,
+    "prefill_tokens": 734,
+    "decode_tokens": 435,
+    "prefill_time_s": 0.08313088293652982,
+    "decode_time_s": 3.520486722001806,
+    "prefill_throughput_toks": 8829.45030862245,
+    "decode_throughput_toks": 123.56246006593427,
+    "spec_proposed": 181,
+    "spec_accepted": 61,
+    "spec_acceptance_rate": 0.3370165745856354
+  }
+}

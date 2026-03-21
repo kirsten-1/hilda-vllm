@@ -79,11 +79,62 @@ def test_scheduler_rejects_shrinking_with_live_decode_slots():
     scheduler.running = set()
     scheduler.max_num_seqs = 2
     scheduler.decode_slots = [object(), None]
-    scheduler.free_slot_indices = deque([1])
+    scheduler.free_slot_indices = [1]
     scheduler.persistent_batch_size = 2
 
     with pytest.raises(AssertionError):
         scheduler._maybe_shrink_batch()
+
+
+def test_scheduler_shrinks_trailing_padding_slots():
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler.running = {object()}
+    scheduler.max_num_seqs = 4
+    scheduler.decode_slots = [object(), None, None, None]
+    scheduler.free_slot_indices = [1, 2, 3]
+    scheduler.persistent_batch_size = 4
+
+    scheduler._maybe_shrink_batch()
+
+    assert scheduler.persistent_batch_size == 1
+
+
+def test_scheduler_reuses_lowest_free_slot():
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler.decode_slots = [None, None, None]
+    scheduler.free_slot_indices = [0, 2, 1]
+    scheduler.persistent_batch_size = 0
+
+    seq = Sequence([1], SamplingParams())
+    scheduler._assign_decode_slot(seq)
+
+    assert seq.decode_slot_index == 0
+    assert scheduler.persistent_batch_size == 1
+
+
+def test_scheduler_compacts_internal_decode_hole():
+    scheduler = Scheduler.__new__(Scheduler)
+    scheduler.decode_slots = [None, None, None]
+    scheduler.free_slot_indices = []
+    scheduler.persistent_batch_size = 3
+
+    seq_a = Sequence([1], SamplingParams())
+    seq_b = Sequence([2], SamplingParams())
+    seq_c = Sequence([3], SamplingParams())
+    scheduler.running = {seq_a, seq_c}
+    seq_a.decode_slot_index = 0
+    seq_b.decode_slot_index = 1
+    seq_c.decode_slot_index = 2
+    scheduler.decode_slots[:] = [seq_a, seq_b, seq_c]
+
+    scheduler._free_decode_slot(seq_b)
+    scheduler._maybe_shrink_batch()
+
+    assert seq_b.decode_slot_index == -1
+    assert seq_c.decode_slot_index == 1
+    assert scheduler.decode_slots == [seq_a, seq_c, None]
+    assert scheduler.persistent_batch_size == 2
+    assert scheduler.free_slot_indices == [2]
 
 
 def test_sampling_params_validate_top_k_and_top_p():

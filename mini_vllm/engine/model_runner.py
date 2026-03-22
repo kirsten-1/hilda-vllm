@@ -1,3 +1,4 @@
+import os
 import pickle
 import torch
 import torch.distributed as dist
@@ -35,7 +36,8 @@ class ModelRunner:
         self.use_spec_decode = bool(config.spec_decode_model)
         self.gamma = config.spec_decode_gamma
 
-        dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
+        self.dist_port = int(os.getenv("MINI_VLLM_DIST_PORT", "2333"))
+        dist.init_process_group("nccl", f"tcp://localhost:{self.dist_port}", world_size=self.world_size, rank=rank)
         torch.cuda.set_device(rank)
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.torch_dtype)
@@ -271,33 +273,32 @@ class ModelRunner:
         """Generate gamma draft tokens per sequence autoregressively using decode path."""
         if not self.draft_model:
             return [[] for _ in seqs], [[] for _ in seqs]
-        all_draft_tokens = [[] for _ in range(len(seqs))]
-        all_draft_probs = [[] for _ in range(len(seqs))]
-        tokens_added = [0] * len(seqs)
-        for step in range(self.gamma):
-            input_ids_list = []
-            context_lens_list = []
-            slot_mapping_list = []
+        bs = len(seqs)
+        cpu = self.decode_cpu_staging
+        gpu = self.decode_gpu_buffers
+        block_tables = self._prepare_spec_block_tables(seqs)
+        temperatures, top_ks, top_ps = self.prepare_sample(seqs)
+        all_draft_tokens = [[] for _ in range(bs)]
+        all_draft_probs = [[] for _ in range(bs)]
+        tokens_added = [0] * bs
+        for _ in range(self.gamma):
             for i, seq in enumerate(seqs):
                 cur_len = len(seq) + tokens_added[i]
                 last_tok = all_draft_tokens[i][-1] if all_draft_tokens[i] else seq.last_token
-                input_ids_list.append(last_tok)
-                context_lens_list.append(cur_len)
                 num_blocks_needed = (cur_len + self.block_size - 1) // self.block_size
                 if num_blocks_needed > len(seq.block_table):
-                    # Not enough blocks allocated; use last available block
                     num_blocks_needed = len(seq.block_table)
                 last_block_tokens = cur_len - (num_blocks_needed - 1) * self.block_size
-                slot = seq.block_table[num_blocks_needed - 1] * self.block_size + last_block_tokens - 1
-                slot_mapping_list.append(slot)
-            input_ids = torch.tensor(input_ids_list, dtype=torch.int64, device="cuda")
-            context_lens = torch.tensor(context_lens_list, dtype=torch.int32, device="cuda")
-            positions = (context_lens - 1).to(dtype=torch.int64)
-            slot_mapping = torch.tensor(slot_mapping_list, dtype=torch.int32, device="cuda")
-            block_tables = self.prepare_block_tables(seqs)
-            set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
-            logits = self.run_draft_model(input_ids, positions)
-            temperatures, top_ks, top_ps = self.prepare_sample(seqs)
+                cpu["input_ids"][i] = last_tok
+                cpu["positions"][i] = cur_len - 1
+                cpu["context_lens"][i] = cur_len
+                cpu["slot_mapping"][i] = seq.block_table[num_blocks_needed - 1] * self.block_size + last_block_tokens - 1
+            gpu["input_ids"][:bs].copy_(cpu["input_ids"][:bs], non_blocking=True)
+            gpu["positions"][:bs].copy_(cpu["positions"][:bs], non_blocking=True)
+            gpu["context_lens"][:bs].copy_(cpu["context_lens"][:bs], non_blocking=True)
+            gpu["slot_mapping"][:bs].copy_(cpu["slot_mapping"][:bs], non_blocking=True)
+            set_context(False, slot_mapping=gpu["slot_mapping"][:bs], context_lens=gpu["context_lens"][:bs], block_tables=block_tables)
+            logits = self.run_draft_model(gpu["input_ids"][:bs], gpu["positions"][:bs])
             probs = torch.softmax(logits.float() / temperatures.unsqueeze(1), dim=-1)
             draft_token_ids = self.sampler(logits, temperatures, top_ks, top_ps).tolist()
             for i, token_id in enumerate(draft_token_ids):
@@ -315,56 +316,49 @@ class ModelRunner:
         using block_tables to read existing cached KV.
         Returns list of (accepted_token_ids, num_accepted) per sequence.
         """
-        # Build verification inputs: for each seq, feed [draft_tok_0, ..., draft_tok_(gamma-1)]
-        # The KV for positions before these draft tokens is already in the target cache.
-        # We also need the logit at position (len(seq)-1) to verify the first draft token,
-        # but that token's KV is already cached, so we re-feed it to get its logit.
-        all_input_ids = []
-        all_positions = []
-        cu_seqlens_q = [0]
-        cu_seqlens_k = [0]
+        cpu = self.spec_cpu_staging
+        gpu = self.spec_gpu_buffers
+        total_tokens = 0
         max_seqlen_q = 0
         max_seqlen_k = 0
-        all_slot_mapping = []
         seq_verify_lens = []
+        cpu["cu_seqlens_q"][0] = 0
+        cpu["cu_seqlens_k"][0] = 0
 
         for i, seq in enumerate(seqs):
-            # We need gamma+1 logits: one for each draft token verification + bonus
-            # Feed: [last_token_already_decoded, draft_0, ..., draft_(gamma-1)]
-            # last_token is at position len(seq)-1 (already in cache, will be overwritten - that's ok)
             verify_tokens = [seq.last_token] + draft_tokens[i]
             num_verify = len(verify_tokens)
             seq_verify_lens.append(num_verify)
             start_pos = len(seq) - 1
+            base_offset = total_tokens
 
-            all_input_ids.extend(verify_tokens)
-            all_positions.extend(range(start_pos, start_pos + num_verify))
-
-            seqlen_q = num_verify
-            seqlen_k = start_pos + num_verify  # total context including cached KV
-            cu_seqlens_q.append(cu_seqlens_q[-1] + seqlen_q)
-            cu_seqlens_k.append(cu_seqlens_k[-1] + seqlen_k)
-            max_seqlen_q = max(seqlen_q, max_seqlen_q)
-            max_seqlen_k = max(seqlen_k, max_seqlen_k)
-
-            for pos in range(start_pos, start_pos + num_verify):
+            for j, token_id in enumerate(verify_tokens):
+                pos = start_pos + j
+                cpu["input_ids"][base_offset + j] = token_id
+                cpu["positions"][base_offset + j] = pos
                 block_idx = pos // self.block_size
                 if block_idx >= len(seq.block_table):
-                    # Safety: if block not allocated, use slot -1 (will be skipped by store kernel)
-                    all_slot_mapping.append(-1)
+                    cpu["slot_mapping"][base_offset + j] = -1
                 else:
                     block_id = seq.block_table[block_idx]
-                    all_slot_mapping.append(block_id * self.block_size + pos % self.block_size)
+                    cpu["slot_mapping"][base_offset + j] = block_id * self.block_size + pos % self.block_size
 
-        input_ids = torch.tensor(all_input_ids, dtype=torch.int64, device="cuda")
-        positions = torch.tensor(all_positions, dtype=torch.int64, device="cuda")
-        cu_seqlens_q_t = torch.tensor(cu_seqlens_q, dtype=torch.int32, device="cuda")
-        cu_seqlens_k_t = torch.tensor(cu_seqlens_k, dtype=torch.int32, device="cuda")
-        slot_mapping = torch.tensor(all_slot_mapping, dtype=torch.int32, device="cuda")
-        block_tables = self.prepare_block_tables(seqs)
+            total_tokens += num_verify
+            seqlen_k = start_pos + num_verify
+            cpu["cu_seqlens_q"][i + 1] = total_tokens
+            cpu["cu_seqlens_k"][i + 1] = cpu["cu_seqlens_k"][i] + seqlen_k
+            max_seqlen_q = max(num_verify, max_seqlen_q)
+            max_seqlen_k = max(seqlen_k, max_seqlen_k)
 
-        set_context(True, cu_seqlens_q_t, cu_seqlens_k_t, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables)
-        hidden_states = self.model(input_ids, positions)
+        gpu["input_ids"][:total_tokens].copy_(cpu["input_ids"][:total_tokens], non_blocking=True)
+        gpu["positions"][:total_tokens].copy_(cpu["positions"][:total_tokens], non_blocking=True)
+        gpu["slot_mapping"][:total_tokens].copy_(cpu["slot_mapping"][:total_tokens], non_blocking=True)
+        gpu["cu_seqlens_q"][:len(seqs) + 1].copy_(cpu["cu_seqlens_q"][:len(seqs) + 1], non_blocking=True)
+        gpu["cu_seqlens_k"][:len(seqs) + 1].copy_(cpu["cu_seqlens_k"][:len(seqs) + 1], non_blocking=True)
+        block_tables = self._prepare_spec_block_tables(seqs)
+
+        set_context(True, gpu["cu_seqlens_q"][:len(seqs) + 1], gpu["cu_seqlens_k"][:len(seqs) + 1], max_seqlen_q, max_seqlen_k, gpu["slot_mapping"][:total_tokens], None, block_tables)
+        hidden_states = self.model(gpu["input_ids"][:total_tokens], gpu["positions"][:total_tokens])
         # Do NOT use compute_logits here because ParallelLMHead in prefill mode
         # only returns last-token logits per seq. We need logits for ALL verify tokens.
         logits = torch.nn.functional.linear(hidden_states, self.model.lm_head.weight)
@@ -488,12 +482,20 @@ class ModelRunner:
     @torch.inference_mode()
     def allocate_decode_runtime_buffers(self):
         max_bs = self.config.max_num_seqs
+        max_spec_tokens = max_bs * (self.gamma + 1)
         self.decode_cpu_staging = dict(
             input_ids=torch.empty(max_bs, dtype=torch.int64, device="cpu", pin_memory=True),
             positions=torch.empty(max_bs, dtype=torch.int64, device="cpu", pin_memory=True),
             slot_mapping=torch.empty(max_bs, dtype=torch.int32, device="cpu", pin_memory=True),
             context_lens=torch.empty(max_bs, dtype=torch.int32, device="cpu", pin_memory=True),
             block_table_row=torch.empty(self.max_num_decode_blocks, dtype=torch.int32, device="cpu", pin_memory=True),
+        )
+        self.spec_cpu_staging = dict(
+            input_ids=torch.empty(max_spec_tokens, dtype=torch.int64, device="cpu", pin_memory=True),
+            positions=torch.empty(max_spec_tokens, dtype=torch.int64, device="cpu", pin_memory=True),
+            slot_mapping=torch.empty(max_spec_tokens, dtype=torch.int32, device="cpu", pin_memory=True),
+            cu_seqlens_q=torch.empty(max_bs + 1, dtype=torch.int32, device="cpu", pin_memory=True),
+            cu_seqlens_k=torch.empty(max_bs + 1, dtype=torch.int32, device="cpu", pin_memory=True),
         )
         self.decode_slot_seq_ids = [-1] * max_bs
         self.decode_slot_block_table_lens = [0] * max_bs
@@ -507,14 +509,21 @@ class ModelRunner:
                 key: self.graph_vars[key]
                 for key in ("input_ids", "positions", "slot_mapping", "context_lens", "block_tables")
             }
-            return
+        else:
+            self.decode_gpu_buffers = dict(
+                input_ids=torch.empty(max_bs, dtype=torch.int64, device="cuda"),
+                positions=torch.empty(max_bs, dtype=torch.int64, device="cuda"),
+                slot_mapping=torch.empty(max_bs, dtype=torch.int32, device="cuda"),
+                context_lens=torch.empty(max_bs, dtype=torch.int32, device="cuda"),
+                block_tables=torch.full((max_bs, self.max_num_decode_blocks), -1, dtype=torch.int32, device="cuda"),
+            )
 
-        self.decode_gpu_buffers = dict(
-            input_ids=torch.empty(max_bs, dtype=torch.int64, device="cuda"),
-            positions=torch.empty(max_bs, dtype=torch.int64, device="cuda"),
-            slot_mapping=torch.empty(max_bs, dtype=torch.int32, device="cuda"),
-            context_lens=torch.empty(max_bs, dtype=torch.int32, device="cuda"),
-            block_tables=torch.full((max_bs, self.max_num_decode_blocks), -1, dtype=torch.int32, device="cuda"),
+        self.spec_gpu_buffers = dict(
+            input_ids=torch.empty(max_spec_tokens, dtype=torch.int64, device="cuda"),
+            positions=torch.empty(max_spec_tokens, dtype=torch.int64, device="cuda"),
+            slot_mapping=torch.empty(max_spec_tokens, dtype=torch.int32, device="cuda"),
+            cu_seqlens_q=torch.empty(max_bs + 1, dtype=torch.int32, device="cuda"),
+            cu_seqlens_k=torch.empty(max_bs + 1, dtype=torch.int32, device="cuda"),
         )
 
     def _clear_decode_block_table_slot(self, slot_idx: int):
@@ -551,6 +560,23 @@ class ModelRunner:
 
         self.decode_slot_seq_ids[slot_idx] = seq.seq_id
         self.decode_slot_block_table_lens[slot_idx] = block_table_len
+
+    def _prepare_spec_block_tables(self, seqs: list[Sequence]):
+        max_len = max(len(seq.block_table) for seq in seqs)
+        slot_indices = []
+        for seq in seqs:
+            slot_idx = seq.decode_slot_index
+            if slot_idx < 0:
+                return self.prepare_block_tables(seqs)
+            self._sync_decode_block_table_row(slot_idx, seq)
+            slot_indices.append(slot_idx)
+
+        first_slot = slot_indices[0]
+        if slot_indices == list(range(first_slot, first_slot + len(slot_indices))):
+            return self.decode_gpu_buffers["block_tables"][first_slot:first_slot + len(slot_indices), :max_len]
+
+        index_tensor = torch.tensor(slot_indices, dtype=torch.int64, device="cuda")
+        return self.decode_gpu_buffers["block_tables"].index_select(0, index_tensor)[:, :max_len]
 
     def _decode_graph_batch_size(self, bs: int) -> int:
         if self.enforce_eager or bs > 512:

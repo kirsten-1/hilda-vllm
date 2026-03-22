@@ -46,12 +46,21 @@ def build_prompt(prompt_len: int, rng_seed: int) -> list[int]:
     return [randint(0, 10000) for _ in range(prompt_len)]
 
 
+def set_benchmark_seed(rng_seed: int):
+    seed(rng_seed)
+    torch.manual_seed(rng_seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(rng_seed)
+
+
 def warmup(llm: LLM):
     llm.generate([[1, 2, 3, 4]], SamplingParams(temperature=0.6, ignore_eos=True, max_tokens=4), use_tqdm=False)
 
 
-def run_latency_benchmark(llm: LLM, prompt_token_ids: list[int], sampling_params: SamplingParams, label: str) -> dict:
+def run_latency_benchmark(llm: LLM, prompt_token_ids: list[int], sampling_params: SamplingParams, label: str, rng_seed: int) -> dict:
+    set_benchmark_seed(rng_seed)
     warmup(llm)
+    set_benchmark_seed(rng_seed)
 
     first_token_time = None
     emitted_tokens = 0
@@ -84,6 +93,11 @@ def run_latency_benchmark(llm: LLM, prompt_token_ids: list[int], sampling_params
         "spec_acceptance_rate": stats.get("spec_acceptance_rate"),
         "spec_proposed": stats.get("spec_proposed"),
         "spec_accepted": stats.get("spec_accepted"),
+        "spec_draft_time_ms": stats.get("spec_draft_time_s", 0.0) * 1000,
+        "spec_verify_time_ms": stats.get("spec_verify_time_s", 0.0) * 1000,
+        "spec_apply_time_ms": stats.get("spec_apply_time_s", 0.0) * 1000,
+        "spec_cleanup_time_ms": stats.get("spec_cleanup_time_s", 0.0) * 1000,
+        "spec_overhead_time_ms": stats.get("spec_overhead_time_s", 0.0) * 1000,
     }
 
 
@@ -122,6 +136,25 @@ def print_comparison(baseline: dict, spec: dict):
             print(f"{name:<30} {bv_str:>16} {sv_str:>16} {'n/a':>12}")
     print("=" * 88)
 
+    print("\nSpec Decode Stage Breakdown")
+    print("-" * 88)
+    stage_metrics = [
+        ("Draft decode (ms)", "spec_draft_time_ms"),
+        ("Verify (ms)", "spec_verify_time_ms"),
+        ("Apply accepted tokens (ms)", "spec_apply_time_ms"),
+        ("Cleanup/hash fixup (ms)", "spec_cleanup_time_ms"),
+        ("Total spec overhead (ms)", "spec_overhead_time_ms"),
+    ]
+    output_tokens = spec.get("output_tokens") or 0
+    for name, key in stage_metrics:
+        value = spec.get(key)
+        if value is None:
+            print(f"{name:<30} {'n/a':>16}")
+            continue
+        per_token = value / output_tokens if output_tokens else None
+        suffix = f" ({per_token:.2f} ms/token)" if per_token is not None else ""
+        print(f"{name:<30} {value:>16.2f}{suffix}")
+
 
 def main():
     args = parse_args()
@@ -138,7 +171,7 @@ def main():
     print(f"Running BASELINE batch=1 latency benchmark ({args.target_model})...")
     print("=" * 60)
     llm_base = LLM(args.target_model, enforce_eager=args.enforce_eager)
-    baseline_result = run_latency_benchmark(llm_base, prompt_token_ids, sampling_params, "baseline")
+    baseline_result = run_latency_benchmark(llm_base, prompt_token_ids, sampling_params, "baseline", args.seed)
     llm_base.exit()
     del llm_base
 
@@ -157,7 +190,7 @@ def main():
         spec_decode_gamma=args.gamma,
         enforce_eager=args.enforce_eager,
     )
-    spec_result = run_latency_benchmark(llm_spec, prompt_token_ids, sampling_params, f"spec-decode-gamma{args.gamma}")
+    spec_result = run_latency_benchmark(llm_spec, prompt_token_ids, sampling_params, f"spec-decode-gamma{args.gamma}", args.seed)
     llm_spec.exit()
     del llm_spec
 

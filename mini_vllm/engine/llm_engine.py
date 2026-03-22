@@ -85,6 +85,10 @@ class LLMEngine:
         num_spec_tokens = 0
         num_spec_proposed = 0
         num_spec_accepted = 0
+        spec_draft_time_s = 0.0
+        spec_verify_time_s = 0.0
+        spec_apply_time_s = 0.0
+        spec_cleanup_time_s = 0.0
         if not is_prefill and self.config.spec_decode_model:
             running_seqs = [scheduled_seq.seq for scheduled_seq in seqs if not scheduled_seq.is_padding and not scheduled_seq.seq.is_finished]
             if running_seqs and len(running_seqs) <= self.config.spec_decode_max_batch_size:
@@ -113,12 +117,17 @@ class LLMEngine:
 
                 if spec_eligible_seqs:
                     # Step 2: Generate draft tokens
+                    t0 = perf_counter()
                     draft_tokens, draft_probs = self.model_runner.call("run_draft_decode", spec_eligible_seqs)
+                    spec_draft_time_s += perf_counter() - t0
 
                     # Step 3: Verify with target model
+                    t0 = perf_counter()
                     verify_results = self.model_runner.call("run_verify", spec_eligible_seqs, draft_tokens, draft_probs)
+                    spec_verify_time_s += perf_counter() - t0
 
                     # Step 4: Apply accepted tokens to sequences
+                    t0 = perf_counter()
                     eos = self.config.eos
                     for seq, (accepted, draft_accepted_count) in zip(spec_eligible_seqs, verify_results):
                         num_spec_proposed += gamma
@@ -135,12 +144,14 @@ class LLMEngine:
                                     self.scheduler._free_decode_slot(seq)
                                     self.scheduler._maybe_shrink_batch()
                                 break
+                    spec_apply_time_s += perf_counter() - t0
 
                     # Step 5: Clean dirty KV slots from rejected draft tokens
                     # (disabled - context_lens prevents reading dirty slots)
                     # self.model_runner.call("cleanup_rejected_kv_slots", spec_eligible_seqs, verify_results, gamma)
 
                     # Step 6: Trim unused blocks and fix hash state for remaining sequences
+                    t0 = perf_counter()
                     for seq in spec_eligible_seqs:
                         if not seq.is_finished:
                             needed_blocks = (len(seq) + bs - 1) // bs
@@ -164,6 +175,7 @@ class LLMEngine:
                                 elif not block_is_full and block.hash != -1:
                                     block.hash = -1
                                     block.token_ids = []
+                    spec_cleanup_time_s += perf_counter() - t0
 
                     # Adaptive gamma: adjust based on acceptance rate
                     if num_spec_proposed > 0:
@@ -182,7 +194,17 @@ class LLMEngine:
         num_prefill_tokens = sum(scheduled_seq.token_chunk_size for scheduled_seq in seqs if not scheduled_seq.is_padding) if is_prefill else 0
         num_decode_tokens = sum(1 for sseq, tid in zip(seqs, token_ids) if not sseq.is_padding and tid is not None) if is_prefill else sum(1 for sseq in seqs if not sseq.is_padding)
         num_decode_tokens += num_spec_tokens
-        return outputs, num_prefill_tokens, num_decode_tokens, num_spec_proposed, num_spec_accepted
+        return (
+            outputs,
+            num_prefill_tokens,
+            num_decode_tokens,
+            num_spec_proposed,
+            num_spec_accepted,
+            spec_draft_time_s,
+            spec_verify_time_s,
+            spec_apply_time_s,
+            spec_cleanup_time_s,
+        )
 
     def is_finished(self):
         return self.scheduler.is_finished()
@@ -199,9 +221,20 @@ class LLMEngine:
         total_start = perf_counter()
         while not self.is_finished():
             t = perf_counter()
-            _, num_prefill_tokens, num_decode_tokens, proposed, accepted = self.step()
+            _, num_prefill_tokens, num_decode_tokens, proposed, accepted, draft_time_s, verify_time_s, apply_time_s, cleanup_time_s = self.step()
             elapsed = perf_counter() - t
-            self._update_generate_stats(stats, num_prefill_tokens, num_decode_tokens, elapsed, proposed, accepted)
+            self._update_generate_stats(
+                stats,
+                num_prefill_tokens,
+                num_decode_tokens,
+                elapsed,
+                proposed,
+                accepted,
+                draft_time_s,
+                verify_time_s,
+                apply_time_s,
+                cleanup_time_s,
+            )
             for seq in seqs:
                 completion_token_ids = seq.completion_token_ids
                 previous_count = emitted_completion_tokens[seq.seq_id]
@@ -233,9 +266,20 @@ class LLMEngine:
         total_start = perf_counter()
         while not self.is_finished():
             t = perf_counter()
-            output, num_prefill_tokens, num_decode_tokens, proposed, accepted = self.step()
+            output, num_prefill_tokens, num_decode_tokens, proposed, accepted, draft_time_s, verify_time_s, apply_time_s, cleanup_time_s = self.step()
             elapsed = perf_counter() - t
-            prefill_throughput, decode_throughput = self._update_generate_stats(stats, num_prefill_tokens, num_decode_tokens, elapsed, proposed, accepted)
+            prefill_throughput, decode_throughput = self._update_generate_stats(
+                stats,
+                num_prefill_tokens,
+                num_decode_tokens,
+                elapsed,
+                proposed,
+                accepted,
+                draft_time_s,
+                verify_time_s,
+                apply_time_s,
+                cleanup_time_s,
+            )
             if use_tqdm:
                 pbar.set_postfix({
                     "Prefill": f"{int(prefill_throughput)}tok/s",
@@ -276,10 +320,25 @@ class LLMEngine:
             "decode_time_s": 0.0,
             "spec_proposed": 0,
             "spec_accepted": 0,
+            "spec_draft_time_s": 0.0,
+            "spec_verify_time_s": 0.0,
+            "spec_apply_time_s": 0.0,
+            "spec_cleanup_time_s": 0.0,
         }
 
     @staticmethod
-    def _update_generate_stats(stats: dict, num_prefill_tokens: int, num_decode_tokens: int, elapsed: float, spec_proposed: int = 0, spec_accepted: int = 0) -> tuple[float, float]:
+    def _update_generate_stats(
+        stats: dict,
+        num_prefill_tokens: int,
+        num_decode_tokens: int,
+        elapsed: float,
+        spec_proposed: int = 0,
+        spec_accepted: int = 0,
+        spec_draft_time_s: float = 0.0,
+        spec_verify_time_s: float = 0.0,
+        spec_apply_time_s: float = 0.0,
+        spec_cleanup_time_s: float = 0.0,
+    ) -> tuple[float, float]:
         prefill_throughput = 0.0
         decode_throughput = 0.0
         if num_prefill_tokens > 0:
@@ -292,10 +351,20 @@ class LLMEngine:
             decode_throughput = num_decode_tokens / elapsed if elapsed else 0.0
         stats["spec_proposed"] += spec_proposed
         stats["spec_accepted"] += spec_accepted
+        stats["spec_draft_time_s"] += spec_draft_time_s
+        stats["spec_verify_time_s"] += spec_verify_time_s
+        stats["spec_apply_time_s"] += spec_apply_time_s
+        stats["spec_cleanup_time_s"] += spec_cleanup_time_s
         return prefill_throughput, decode_throughput
 
     def _set_last_generate_stats(self, stats: dict, total_time: float):
         total_output_tokens = stats["decode_tokens"]
+        spec_overhead_time_s = (
+            stats["spec_draft_time_s"]
+            + stats["spec_verify_time_s"]
+            + stats["spec_apply_time_s"]
+            + stats["spec_cleanup_time_s"]
+        )
         self.last_generate_stats = {
             "num_requests": stats["num_requests"],
             "prompt_tokens": stats["prompt_tokens"],
@@ -311,4 +380,9 @@ class LLMEngine:
             "spec_proposed": stats["spec_proposed"],
             "spec_accepted": stats["spec_accepted"],
             "spec_acceptance_rate": stats["spec_accepted"] / stats["spec_proposed"] if stats["spec_proposed"] > 0 else 0.0,
+            "spec_draft_time_s": stats["spec_draft_time_s"],
+            "spec_verify_time_s": stats["spec_verify_time_s"],
+            "spec_apply_time_s": stats["spec_apply_time_s"],
+            "spec_cleanup_time_s": stats["spec_cleanup_time_s"],
+            "spec_overhead_time_s": spec_overhead_time_s,
         }

@@ -1,4 +1,7 @@
+import asyncio
 import json
+import time
+from types import SimpleNamespace
 
 from fastapi.testclient import TestClient
 
@@ -59,6 +62,40 @@ class FakeLLM:
                 "completion_token_ids": token_ids,
                 "is_finished": True,
             }
+
+    def exit(self):
+        return None
+
+
+class FakeContinuousLLM:
+    def __init__(self):
+        self.tokenizer = FakeTokenizer()
+        self._seq_id = 0
+        self._active = {}
+        self.max_active = 0
+
+    def add_request(self, prompt, sampling_params):
+        response_text = f"reply:{prompt}"
+        seq = SimpleNamespace(
+            seq_id=self._seq_id,
+            completion_token_ids=[],
+            is_finished=False,
+            _response_token_ids=[ord(ch) for ch in response_text],
+            _cursor=0,
+        )
+        self._seq_id += 1
+        self._active[seq.seq_id] = seq
+        self.max_active = max(self.max_active, len(self._active))
+        return seq
+
+    def step(self):
+        time.sleep(0.01)
+        for seq_id, seq in list(self._active.items()):
+            seq.completion_token_ids.append(seq._response_token_ids[seq._cursor])
+            seq._cursor += 1
+            if seq._cursor >= len(seq._response_token_ids):
+                seq.is_finished = True
+                del self._active[seq_id]
 
     def exit(self):
         return None
@@ -181,3 +218,24 @@ def test_streaming_unknown_model_returns_bad_request():
     assert response.status_code == 400
     payload = response.json()
     assert payload["detail"]["message"] == "Unknown model: other-model"
+
+
+def test_engine_adapter_batches_concurrent_generations_on_background_loop():
+    llm = FakeContinuousLLM()
+    adapter = EngineAdapter(llm=llm, model_name="Qwen3-0.6B")
+
+    async def run_requests():
+        sampling_params = adapter._sampling_params(temperature=0.7, max_tokens=16, top_k=-1, top_p=1.0)
+        return await asyncio.gather(
+            adapter._generate(["alpha"], sampling_params),
+            adapter._generate(["beta"], sampling_params),
+        )
+
+    try:
+        first, second = asyncio.run(run_requests())
+    finally:
+        adapter.close()
+
+    assert first[0]["text"] == "reply:alpha"
+    assert second[0]["text"] == "reply:beta"
+    assert llm.max_active >= 2

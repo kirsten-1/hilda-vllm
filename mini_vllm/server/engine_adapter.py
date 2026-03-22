@@ -2,6 +2,7 @@ import asyncio
 import time
 import uuid
 from collections.abc import AsyncIterator
+from dataclasses import dataclass, field
 from pathlib import Path
 import threading
 from typing import Any
@@ -25,6 +26,30 @@ class UnsupportedRequestError(ValueError):
     pass
 
 
+_STREAM_SENTINEL = object()
+
+
+@dataclass
+class _QueuedRequest:
+    loop: asyncio.AbstractEventLoop
+    prompts: list[str]
+    sampling_params: SamplingParams
+    stream: bool
+    future: asyncio.Future | None = None
+    queue: asyncio.Queue | None = None
+    outputs: dict[int, dict[str, Any]] = field(default_factory=dict)
+    remaining: int = 0
+
+
+@dataclass
+class _ActiveSequence:
+    request: _QueuedRequest
+    seq: Any
+    request_index: int
+    emitted_tokens: int = 0
+    finish_event_sent: bool = False
+
+
 class EngineAdapter:
     def __init__(
         self,
@@ -38,7 +63,19 @@ class EngineAdapter:
             raise ValueError("Either model or llm must be provided")
         self.llm = llm or LLM(model, **llm_kwargs)
         self.model_name = model_name or (Path(model).name if model else "mini_vllm")
-        self._lock = asyncio.Lock()
+        self._supports_continuous_batching = all(hasattr(self.llm, attr) for attr in ("add_request", "step"))
+        self._closed = False
+        self._engine_error: Exception | None = None
+
+        if self._supports_continuous_batching:
+            self._worker_condition = threading.Condition()
+            self._pending_requests: list[_QueuedRequest] = []
+            self._active_sequences: dict[int, _ActiveSequence] = {}
+            self._stop_worker = False
+            self._worker = threading.Thread(target=self._engine_loop, daemon=True)
+            self._worker.start()
+        else:
+            self._lock = asyncio.Lock()
 
     async def list_models(self) -> ModelList:
         return ModelList(
@@ -170,10 +207,35 @@ class EngineAdapter:
                 }
 
     def close(self):
+        if self._closed:
+            return
+        self._closed = True
+        if self._supports_continuous_batching:
+            with self._worker_condition:
+                self._stop_worker = True
+                self._worker_condition.notify_all()
+            self._worker.join()
         if hasattr(self.llm, "exit"):
             self.llm.exit()
 
     async def _generate(self, prompts: list[str], sampling_params: SamplingParams) -> list[dict[str, Any]]:
+        if not self._supports_continuous_batching:
+            return await self._generate_legacy(prompts, sampling_params)
+
+        loop = asyncio.get_running_loop()
+        future = loop.create_future()
+        request = _QueuedRequest(
+            loop=loop,
+            prompts=list(prompts),
+            sampling_params=sampling_params,
+            stream=False,
+            future=future,
+            remaining=len(prompts),
+        )
+        self._submit_request(request)
+        return await future
+
+    async def _generate_legacy(self, prompts: list[str], sampling_params: SamplingParams) -> list[dict[str, Any]]:
         async with self._lock:
             return await asyncio.to_thread(
                 self.llm.generate,
@@ -183,6 +245,31 @@ class EngineAdapter:
             )
 
     async def _generate_stream(self, prompts: list[str], sampling_params: SamplingParams) -> AsyncIterator[dict[str, Any]]:
+        if not self._supports_continuous_batching:
+            async for item in self._generate_stream_legacy(prompts, sampling_params):
+                yield item
+            return
+
+        loop = asyncio.get_running_loop()
+        queue: asyncio.Queue = asyncio.Queue()
+        request = _QueuedRequest(
+            loop=loop,
+            prompts=list(prompts),
+            sampling_params=sampling_params,
+            stream=True,
+            queue=queue,
+            remaining=len(prompts),
+        )
+        self._submit_request(request)
+        while True:
+            item = await queue.get()
+            if item is _STREAM_SENTINEL:
+                break
+            if isinstance(item, Exception):
+                raise item
+            yield item
+
+    async def _generate_stream_legacy(self, prompts: list[str], sampling_params: SamplingParams) -> AsyncIterator[dict[str, Any]]:
         loop = asyncio.get_running_loop()
         queue: asyncio.Queue = asyncio.Queue()
         sentinel = object()
@@ -212,6 +299,131 @@ class EngineAdapter:
                     yield item
             finally:
                 await asyncio.to_thread(thread.join)
+
+    def _submit_request(self, request: _QueuedRequest):
+        if self._engine_error is not None:
+            raise RuntimeError("Engine loop is unavailable") from self._engine_error
+        with self._worker_condition:
+            if self._closed:
+                raise RuntimeError("Engine adapter is closed")
+            self._pending_requests.append(request)
+            self._worker_condition.notify_all()
+
+    def _engine_loop(self):
+        while True:
+            with self._worker_condition:
+                while not self._pending_requests and not self._active_sequences and not self._stop_worker:
+                    self._worker_condition.wait()
+                if self._stop_worker and not self._pending_requests and not self._active_sequences:
+                    return
+                pending_requests = self._pending_requests
+                self._pending_requests = []
+
+            for request in pending_requests:
+                self._activate_request(request)
+
+            if not self._active_sequences:
+                continue
+
+            try:
+                self.llm.step()
+            except Exception as exc:  # pragma: no cover - threaded engine failures are surfaced asynchronously
+                self._engine_error = exc
+                self._fail_active_requests(exc)
+                continue
+
+            self._publish_step_updates()
+
+    def _activate_request(self, request: _QueuedRequest):
+        try:
+            new_entries = []
+            for request_index, prompt in enumerate(request.prompts):
+                seq = self.llm.add_request(prompt, request.sampling_params)
+                new_entries.append(_ActiveSequence(request=request, seq=seq, request_index=request_index))
+            for entry in new_entries:
+                self._active_sequences[entry.seq.seq_id] = entry
+        except Exception as exc:
+            self._fail_request(request, exc)
+
+    def _publish_step_updates(self):
+        completed_requests: list[_QueuedRequest] = []
+        for seq_id, entry in list(self._active_sequences.items()):
+            completion_token_ids = list(entry.seq.completion_token_ids)
+            new_token_ids = completion_token_ids[entry.emitted_tokens:]
+            if entry.request.stream and (new_token_ids or (entry.seq.is_finished and not entry.finish_event_sent)):
+                self._push_stream_item(
+                    entry.request,
+                    {
+                        "request_index": entry.request_index,
+                        "seq_id": entry.seq.seq_id,
+                        "token_ids": list(new_token_ids),
+                        "completion_token_ids": completion_token_ids,
+                        "is_finished": entry.seq.is_finished,
+                    },
+                )
+                entry.finish_event_sent = entry.seq.is_finished
+            entry.emitted_tokens = len(completion_token_ids)
+
+            if not entry.seq.is_finished:
+                continue
+
+            entry.request.outputs[entry.request_index] = {
+                "text": self.llm.tokenizer.decode(completion_token_ids),
+                "token_ids": completion_token_ids,
+            }
+            entry.request.remaining -= 1
+            del self._active_sequences[seq_id]
+            if entry.request.remaining == 0:
+                completed_requests.append(entry.request)
+
+        for request in completed_requests:
+            self._complete_request(request)
+
+    def _fail_active_requests(self, exc: Exception):
+        requests = []
+        seen = set()
+        for entry in self._active_sequences.values():
+            request_id = id(entry.request)
+            if request_id in seen:
+                continue
+            seen.add(request_id)
+            requests.append(entry.request)
+        self._active_sequences.clear()
+        for request in requests:
+            self._fail_request(request, exc)
+
+    def _complete_request(self, request: _QueuedRequest):
+        if request.stream:
+            self._push_stream_item(request, _STREAM_SENTINEL)
+            return
+
+        outputs = [request.outputs[i] for i in range(len(request.prompts))]
+        request.loop.call_soon_threadsafe(self._resolve_future, request.future, outputs)
+
+    def _fail_request(self, request: _QueuedRequest, exc: Exception):
+        if request.stream:
+            self._push_stream_item(request, exc)
+            self._push_stream_item(request, _STREAM_SENTINEL)
+            return
+        request.loop.call_soon_threadsafe(self._reject_future, request.future, exc)
+
+    @staticmethod
+    def _resolve_future(future: asyncio.Future | None, value: Any):
+        if future is None or future.done() or future.cancelled():
+            return
+        future.set_result(value)
+
+    @staticmethod
+    def _reject_future(future: asyncio.Future | None, exc: Exception):
+        if future is None or future.done() or future.cancelled():
+            return
+        future.set_exception(exc)
+
+    @staticmethod
+    def _push_stream_item(request: _QueuedRequest, item: Any):
+        if request.queue is None:
+            return
+        request.loop.call_soon_threadsafe(request.queue.put_nowait, item)
 
     def _build_chat_prompt(self, messages) -> str:
         rendered_messages = [

@@ -26,6 +26,7 @@ class ModelRunner:
         self.config = config
         hf_config = config.hf_config
         self.block_size = config.kvcache_block_size
+        self.max_num_decode_blocks = (config.max_model_len + self.block_size - 1) // self.block_size
         self.enforce_eager = config.enforce_eager
         self.world_size = config.tensor_parallel_size
         self.rank = rank
@@ -62,6 +63,7 @@ class ModelRunner:
             self.capture_cudagraph()
             if self.use_spec_decode:
                 self.capture_draft_cudagraph()
+        self.allocate_decode_runtime_buffers()
         torch.set_default_device("cpu")
         torch.set_default_dtype(default_dtype)
 
@@ -483,6 +485,77 @@ class ModelRunner:
                 slot_mapping,
             )
 
+    def allocate_decode_runtime_buffers(self):
+        max_bs = self.config.max_num_seqs
+        self.decode_cpu_staging = dict(
+            input_ids=torch.empty(max_bs, dtype=torch.int64, pin_memory=True),
+            positions=torch.empty(max_bs, dtype=torch.int64, pin_memory=True),
+            slot_mapping=torch.empty(max_bs, dtype=torch.int32, pin_memory=True),
+            context_lens=torch.empty(max_bs, dtype=torch.int32, pin_memory=True),
+            block_table_row=torch.empty(self.max_num_decode_blocks, dtype=torch.int32, pin_memory=True),
+        )
+        self.decode_slot_seq_ids = [-1] * max_bs
+        self.decode_slot_block_table_lens = [0] * max_bs
+        self.decode_uses_graph_buffers = not self.enforce_eager and max_bs <= 512
+
+        if self.decode_uses_graph_buffers:
+            self.graph_vars["slot_mapping"].fill_(-1)
+            self.graph_vars["context_lens"].zero_()
+            self.graph_vars["block_tables"].fill_(-1)
+            self.decode_gpu_buffers = {
+                key: self.graph_vars[key]
+                for key in ("input_ids", "positions", "slot_mapping", "context_lens", "block_tables")
+            }
+            return
+
+        self.decode_gpu_buffers = dict(
+            input_ids=torch.empty(max_bs, dtype=torch.int64, device="cuda"),
+            positions=torch.empty(max_bs, dtype=torch.int64, device="cuda"),
+            slot_mapping=torch.empty(max_bs, dtype=torch.int32, device="cuda"),
+            context_lens=torch.empty(max_bs, dtype=torch.int32, device="cuda"),
+            block_tables=torch.full((max_bs, self.max_num_decode_blocks), -1, dtype=torch.int32, device="cuda"),
+        )
+
+    def _clear_decode_block_table_slot(self, slot_idx: int):
+        if self.decode_slot_seq_ids[slot_idx] == -1 and self.decode_slot_block_table_lens[slot_idx] == 0:
+            return
+        self.decode_gpu_buffers["block_tables"][slot_idx].fill_(-1)
+        self.decode_slot_seq_ids[slot_idx] = -1
+        self.decode_slot_block_table_lens[slot_idx] = 0
+
+    def _copy_decode_block_table_row(self, slot_idx: int, block_table: list[int]):
+        staging_row = self.decode_cpu_staging["block_table_row"]
+        staging_row.fill_(-1)
+        for i, block_id in enumerate(block_table):
+            staging_row[i] = block_id
+        self.decode_gpu_buffers["block_tables"][slot_idx].copy_(staging_row, non_blocking=True)
+
+    def _sync_decode_block_table_row(self, slot_idx: int, seq: Sequence):
+        block_table = seq.block_table
+        block_table_len = len(block_table)
+        prev_seq_id = self.decode_slot_seq_ids[slot_idx]
+        prev_block_table_len = self.decode_slot_block_table_lens[slot_idx]
+
+        if prev_seq_id != seq.seq_id or block_table_len < prev_block_table_len:
+            self._copy_decode_block_table_row(slot_idx, block_table)
+        elif block_table_len > prev_block_table_len:
+            staging_row = self.decode_cpu_staging["block_table_row"]
+            tail_len = block_table_len - prev_block_table_len
+            for i, block_id in enumerate(block_table[prev_block_table_len:block_table_len]):
+                staging_row[i] = block_id
+            self.decode_gpu_buffers["block_tables"][slot_idx, prev_block_table_len:block_table_len].copy_(
+                staging_row[:tail_len],
+                non_blocking=True,
+            )
+
+        self.decode_slot_seq_ids[slot_idx] = seq.seq_id
+        self.decode_slot_block_table_lens[slot_idx] = block_table_len
+
+    def _decode_graph_batch_size(self, bs: int) -> int:
+        if self.enforce_eager or bs > 512:
+            return bs
+        return next(graph_bs for graph_bs in self.graph_bs if graph_bs >= bs)
+
     def prepare_block_tables(self, seqs: list[Sequence]):
         max_len = max(len(seq.block_table) for seq in seqs)
         block_tables = [seq.block_table + [-1] * (max_len - len(seq.block_table)) for seq in seqs]
@@ -529,38 +602,46 @@ class ModelRunner:
 
     def prepare_decode(self, scheduled_seqs: list[ScheduledSequence]):
         bs = len(scheduled_seqs)
-        input_ids_list = [0] * bs
-        context_lens_list = [0] * bs
-        slot_mapping_list = [-1] * bs
-        real_seqs_with_idx = []
-        max_block_table_len = 1
+        graph_bs = self._decode_graph_batch_size(bs)
+        cpu = self.decode_cpu_staging
+        gpu = self.decode_gpu_buffers
 
-        for i, sseq in enumerate(scheduled_seqs):
-            if sseq.is_padding:
+        cpu["input_ids"][:bs].zero_()
+        cpu["positions"][:bs].zero_()
+        cpu["context_lens"][:bs].zero_()
+        cpu["slot_mapping"][:bs].fill_(-1)
+
+        for i, scheduled_seq in enumerate(scheduled_seqs):
+            slot_idx = scheduled_seq.slot_index if scheduled_seq.slot_index >= 0 else i
+            assert slot_idx == i, "decode scheduling is expected to follow slot order"
+            if scheduled_seq.is_padding:
+                self._clear_decode_block_table_slot(slot_idx)
                 continue
-            seq = sseq.seq
-            input_ids_list[i] = seq.last_token
-            context_lens_list[i] = len(seq)
-            slot_mapping_list[i] = seq.block_table[-1] * self.block_size + seq.last_block_num_tokens - 1
-            real_seqs_with_idx.append((i, seq))
-            max_block_table_len = max(max_block_table_len, len(seq.block_table))
 
-        block_tables_list = [[0] * max_block_table_len for _ in range(bs)]
-        for i, seq in real_seqs_with_idx:
-            bt = seq.block_table
-            for j, bid in enumerate(bt):
-                block_tables_list[i][j] = bid
-            for j in range(len(bt), max_block_table_len):
-                block_tables_list[i][j] = -1
+            seq = scheduled_seq.seq
+            context_len = len(seq)
+            cpu["input_ids"][i] = seq.last_token
+            cpu["positions"][i] = context_len - 1
+            cpu["context_lens"][i] = context_len
+            cpu["slot_mapping"][i] = seq.block_table[-1] * self.block_size + seq.last_block_num_tokens - 1
+            self._sync_decode_block_table_row(slot_idx, seq)
 
-        input_ids = torch.tensor(input_ids_list, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
-        context_lens = torch.tensor(context_lens_list, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        positions = (context_lens - 1).to(dtype=torch.int64)
-        positions.clamp_min_(0)
-        slot_mapping = torch.tensor(slot_mapping_list, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        block_tables = torch.tensor(block_tables_list, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
-        set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
-        return input_ids, positions
+        gpu["input_ids"][:bs].copy_(cpu["input_ids"][:bs], non_blocking=True)
+        gpu["positions"][:bs].copy_(cpu["positions"][:bs], non_blocking=True)
+        gpu["context_lens"][:bs].copy_(cpu["context_lens"][:bs], non_blocking=True)
+        gpu["slot_mapping"][:bs].copy_(cpu["slot_mapping"][:bs], non_blocking=True)
+        if graph_bs > bs:
+            gpu["positions"][bs:graph_bs].zero_()
+            gpu["context_lens"][bs:graph_bs].zero_()
+            gpu["slot_mapping"][bs:graph_bs].fill_(-1)
+
+        set_context(
+            False,
+            slot_mapping=gpu["slot_mapping"][:bs],
+            context_lens=gpu["context_lens"][:bs],
+            block_tables=gpu["block_tables"][:bs],
+        )
+        return gpu["input_ids"][:bs], gpu["positions"][:bs]
 
     def prepare_sample(self, seqs: list[Sequence]):
         temperatures = []
@@ -583,13 +664,18 @@ class ModelRunner:
         context = get_context()
         graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
         graph_vars = self.graph_vars
-        graph_vars["input_ids"][:bs] = input_ids
-        graph_vars["positions"][:bs] = positions
-        graph_vars["slot_mapping"].fill_(-1)
-        graph_vars["slot_mapping"][:bs] = context.slot_mapping
-        graph_vars["context_lens"].zero_()
-        graph_vars["context_lens"][:bs] = context.context_lens
-        graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
+        if input_ids.data_ptr() != graph_vars["input_ids"].data_ptr():
+            graph_vars["input_ids"][:bs].copy_(input_ids, non_blocking=True)
+        if positions.data_ptr() != graph_vars["positions"].data_ptr():
+            graph_vars["positions"][:bs].copy_(positions, non_blocking=True)
+        if context.slot_mapping.data_ptr() != graph_vars["slot_mapping"].data_ptr():
+            graph_vars["slot_mapping"].fill_(-1)
+            graph_vars["slot_mapping"][:bs].copy_(context.slot_mapping, non_blocking=True)
+        if context.context_lens.data_ptr() != graph_vars["context_lens"].data_ptr():
+            graph_vars["context_lens"].zero_()
+            graph_vars["context_lens"][:bs].copy_(context.context_lens, non_blocking=True)
+        if context.block_tables.data_ptr() != graph_vars["block_tables"].data_ptr():
+            graph_vars["block_tables"][:bs].copy_(context.block_tables, non_blocking=True)
         graph.replay()
         return self.model.compute_logits(graph_vars["outputs"][:bs])
 
@@ -637,7 +723,7 @@ class ModelRunner:
         config = self.config
         hf_config = config.hf_config
         max_bs = min(self.config.max_num_seqs, 512)
-        max_num_blocks = (config.max_model_len + self.block_size - 1) // self.block_size
+        max_num_blocks = self.max_num_decode_blocks
         input_ids = torch.zeros(max_bs, dtype=torch.int64)
         positions = torch.zeros(max_bs, dtype=torch.int64)
         slot_mapping = torch.zeros(max_bs, dtype=torch.int32)

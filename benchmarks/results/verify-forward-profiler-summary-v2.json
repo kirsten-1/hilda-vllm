@@ -1,0 +1,39 @@
+{
+  "target_model": "/root/autodl-tmp",
+  "draft_model": "/root/huggingface/Qwen3-0.6B",
+  "gamma": 3,
+  "seed": 0,
+  "verify_findings": {
+    "graph_replay_present": false,
+    "context_prep_us": 41.1,
+    "context_prep_pct_of_verify_forward": 0.076,
+    "kv_store_pct_of_forward": 0.39,
+    "flash_attention_pct_of_forward": 2.46,
+    "dense_gemm_pct_of_forward": 86.8,
+    "other_kernels_pct_of_forward": 10.4,
+    "model_forward_pct_of_verify": 94.7
+  },
+  "kernel_attribution_us": {
+    "gemm": 9178.7,
+    "flash_attention": 260.6,
+    "kv_store": 41.2,
+    "other": 1098.7
+  },
+  "host_overheads_ms": {
+    "compiled_fx_graph_annotations": 11.2,
+    "cuda_launch_api": 8.9
+  },
+  "conclusion": {
+    "primary_bottleneck": "dense GEMM in prefill-like verify forward",
+    "not_bottlenecks": [
+      "cuda graph replay",
+      "set_context/reset_context",
+      "KV store",
+      "varlen flash attention"
+    ],
+    "optimization_implication": "Further verify optimization is now an operator/execution-path problem rather than a Python or tensor-prep problem."
+  },
+  "artifacts": {
+    "trace": "benchmarks/results/verify-forward-profiler-trace-v2.json"
+  }
+}

@@ -27,7 +27,7 @@ Model: Qwen3-0.6B, 256 requests, random prompts (50-512 tokens), max output 1024
 | hilda-vllm | 133,966 | 12.98 | 10,318 |
 | hilda-vllm + persistent batching | 133,966 | 14.21 | 9,425 |
 
-> Persistent batching adds ~6.5% overhead from per-step tensor reconstruction for padded slots. The trade-off enables stable decode slot management needed for speculative decoding and preemption.
+> Persistent batching adds overhead from padded slot management. Pre-allocated GPU buffers and GPU-resident block tables recover most of the gap — the continuous batching server path reaches 10,339 tok/s at 32 concurrent requests (see Server Benchmark below).
 
 ## FP8 KV Cache
 
@@ -60,6 +60,17 @@ Mixed long-prefill + short-decode benchmark:
 | --- | ---: | ---: | ---: | ---: |
 | hilda-vllm | 5.72 | 124.04 | 196.16 | 18 |
 | hilda-vllm-fp8 | 4.82 | 123.33 | 199.45 | 18 |
+
+## Server Benchmark
+
+Continuous batching server, Qwen3-0.6B, 32 concurrent requests, max_tokens=256.
+
+| Mode | Completion Tokens | Time (s) | Throughput (tok/s) | Mean Latency (s) | TTFT (ms) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Non-streaming | 8,065 | 1.33 | 6,087 | 1.31 | - |
+| Streaming | ~7,953 | 2.47 | 3,226 | 2.37 | 80 |
+
+> Streamed and non-streamed requests share the same background engine loop and are merged into the same decode steps. Streaming throughput is lower due to SSE encoding and incremental text decoding overhead.
 
 ## Speculative Decoding
 
@@ -142,6 +153,6 @@ PYTHONPATH=. python benchmarks/bench_server_concurrent.py --url http://127.0.0.1
 
 ## Next
 
-- Publish representative server concurrency results for both non-streaming throughput and streaming TTFT.
+- Reduce streaming throughput gap versus non-streaming path (SSE encoding and incremental text decoding overhead).
 - Improve speculative decoding heuristics for low-acceptance prompts instead of relying on a single fixed gamma.
 - Revisit verify forward kernels only with a new implementation that beats the default GEMM path in 8B end-to-end tests.

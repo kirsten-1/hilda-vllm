@@ -87,6 +87,10 @@ class LLMEngine:
         num_spec_accepted = 0
         spec_draft_time_s = 0.0
         spec_verify_time_s = 0.0
+        spec_verify_prep_time_s = 0.0
+        spec_verify_forward_time_s = 0.0
+        spec_verify_lmhead_time_s = 0.0
+        spec_verify_sampling_time_s = 0.0
         spec_apply_time_s = 0.0
         spec_cleanup_time_s = 0.0
         if not is_prefill and self.config.spec_decode_model:
@@ -125,6 +129,11 @@ class LLMEngine:
                     t0 = perf_counter()
                     verify_results = self.model_runner.call("run_verify", spec_eligible_seqs, draft_tokens, draft_probs)
                     spec_verify_time_s += perf_counter() - t0
+                    verify_breakdown = getattr(self.model_runner, "last_verify_breakdown", None) or {}
+                    spec_verify_prep_time_s += verify_breakdown.get("prep_time_s", 0.0)
+                    spec_verify_forward_time_s += verify_breakdown.get("forward_time_s", 0.0)
+                    spec_verify_lmhead_time_s += verify_breakdown.get("lmhead_time_s", 0.0)
+                    spec_verify_sampling_time_s += verify_breakdown.get("sampling_time_s", 0.0)
 
                     # Step 4: Apply accepted tokens to sequences
                     t0 = perf_counter()
@@ -202,6 +211,10 @@ class LLMEngine:
             num_spec_accepted,
             spec_draft_time_s,
             spec_verify_time_s,
+            spec_verify_prep_time_s,
+            spec_verify_forward_time_s,
+            spec_verify_lmhead_time_s,
+            spec_verify_sampling_time_s,
             spec_apply_time_s,
             spec_cleanup_time_s,
         )
@@ -221,7 +234,7 @@ class LLMEngine:
         total_start = perf_counter()
         while not self.is_finished():
             t = perf_counter()
-            _, num_prefill_tokens, num_decode_tokens, proposed, accepted, draft_time_s, verify_time_s, apply_time_s, cleanup_time_s = self.step()
+            _, num_prefill_tokens, num_decode_tokens, proposed, accepted, draft_time_s, verify_time_s, verify_prep_time_s, verify_forward_time_s, verify_lmhead_time_s, verify_sampling_time_s, apply_time_s, cleanup_time_s = self.step()
             elapsed = perf_counter() - t
             self._update_generate_stats(
                 stats,
@@ -232,6 +245,10 @@ class LLMEngine:
                 accepted,
                 draft_time_s,
                 verify_time_s,
+                verify_prep_time_s,
+                verify_forward_time_s,
+                verify_lmhead_time_s,
+                verify_sampling_time_s,
                 apply_time_s,
                 cleanup_time_s,
             )
@@ -266,7 +283,7 @@ class LLMEngine:
         total_start = perf_counter()
         while not self.is_finished():
             t = perf_counter()
-            output, num_prefill_tokens, num_decode_tokens, proposed, accepted, draft_time_s, verify_time_s, apply_time_s, cleanup_time_s = self.step()
+            output, num_prefill_tokens, num_decode_tokens, proposed, accepted, draft_time_s, verify_time_s, verify_prep_time_s, verify_forward_time_s, verify_lmhead_time_s, verify_sampling_time_s, apply_time_s, cleanup_time_s = self.step()
             elapsed = perf_counter() - t
             prefill_throughput, decode_throughput = self._update_generate_stats(
                 stats,
@@ -277,6 +294,10 @@ class LLMEngine:
                 accepted,
                 draft_time_s,
                 verify_time_s,
+                verify_prep_time_s,
+                verify_forward_time_s,
+                verify_lmhead_time_s,
+                verify_sampling_time_s,
                 apply_time_s,
                 cleanup_time_s,
             )
@@ -322,6 +343,10 @@ class LLMEngine:
             "spec_accepted": 0,
             "spec_draft_time_s": 0.0,
             "spec_verify_time_s": 0.0,
+            "spec_verify_prep_time_s": 0.0,
+            "spec_verify_forward_time_s": 0.0,
+            "spec_verify_lmhead_time_s": 0.0,
+            "spec_verify_sampling_time_s": 0.0,
             "spec_apply_time_s": 0.0,
             "spec_cleanup_time_s": 0.0,
         }
@@ -336,6 +361,10 @@ class LLMEngine:
         spec_accepted: int = 0,
         spec_draft_time_s: float = 0.0,
         spec_verify_time_s: float = 0.0,
+        spec_verify_prep_time_s: float = 0.0,
+        spec_verify_forward_time_s: float = 0.0,
+        spec_verify_lmhead_time_s: float = 0.0,
+        spec_verify_sampling_time_s: float = 0.0,
         spec_apply_time_s: float = 0.0,
         spec_cleanup_time_s: float = 0.0,
     ) -> tuple[float, float]:
@@ -353,6 +382,10 @@ class LLMEngine:
         stats["spec_accepted"] += spec_accepted
         stats["spec_draft_time_s"] += spec_draft_time_s
         stats["spec_verify_time_s"] += spec_verify_time_s
+        stats["spec_verify_prep_time_s"] += spec_verify_prep_time_s
+        stats["spec_verify_forward_time_s"] += spec_verify_forward_time_s
+        stats["spec_verify_lmhead_time_s"] += spec_verify_lmhead_time_s
+        stats["spec_verify_sampling_time_s"] += spec_verify_sampling_time_s
         stats["spec_apply_time_s"] += spec_apply_time_s
         stats["spec_cleanup_time_s"] += spec_cleanup_time_s
         return prefill_throughput, decode_throughput
@@ -382,6 +415,10 @@ class LLMEngine:
             "spec_acceptance_rate": stats["spec_accepted"] / stats["spec_proposed"] if stats["spec_proposed"] > 0 else 0.0,
             "spec_draft_time_s": stats["spec_draft_time_s"],
             "spec_verify_time_s": stats["spec_verify_time_s"],
+            "spec_verify_prep_time_s": stats["spec_verify_prep_time_s"],
+            "spec_verify_forward_time_s": stats["spec_verify_forward_time_s"],
+            "spec_verify_lmhead_time_s": stats["spec_verify_lmhead_time_s"],
+            "spec_verify_sampling_time_s": stats["spec_verify_sampling_time_s"],
             "spec_apply_time_s": stats["spec_apply_time_s"],
             "spec_cleanup_time_s": stats["spec_cleanup_time_s"],
             "spec_overhead_time_s": spec_overhead_time_s,

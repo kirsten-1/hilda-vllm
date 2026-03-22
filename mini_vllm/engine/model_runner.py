@@ -1,5 +1,7 @@
 import os
 import pickle
+from time import perf_counter
+
 import torch
 import torch.distributed as dist
 from multiprocessing.synchronize import Event
@@ -35,6 +37,12 @@ class ModelRunner:
         self.use_fp8_kv_cache = config.kv_cache_dtype == "fp8"
         self.use_spec_decode = bool(config.spec_decode_model)
         self.gamma = config.spec_decode_gamma
+        self.last_verify_breakdown = {
+            "prep_time_s": 0.0,
+            "forward_time_s": 0.0,
+            "lmhead_time_s": 0.0,
+            "sampling_time_s": 0.0,
+        }
 
         self.dist_port = int(os.getenv("MINI_VLLM_DIST_PORT", "2333"))
         dist.init_process_group("nccl", f"tcp://localhost:{self.dist_port}", world_size=self.world_size, rank=rank)
@@ -322,6 +330,7 @@ class ModelRunner:
         max_seqlen_q = 0
         max_seqlen_k = 0
         seq_verify_lens = []
+        prep_t0 = perf_counter()
         cpu["cu_seqlens_q"][0] = 0
         cpu["cu_seqlens_k"][0] = 0
 
@@ -356,15 +365,24 @@ class ModelRunner:
         gpu["cu_seqlens_q"][:len(seqs) + 1].copy_(cpu["cu_seqlens_q"][:len(seqs) + 1], non_blocking=True)
         gpu["cu_seqlens_k"][:len(seqs) + 1].copy_(cpu["cu_seqlens_k"][:len(seqs) + 1], non_blocking=True)
         block_tables = self._prepare_spec_block_tables(seqs)
+        torch.cuda.synchronize()
+        prep_time_s = perf_counter() - prep_t0
 
+        forward_t0 = perf_counter()
         set_context(True, gpu["cu_seqlens_q"][:len(seqs) + 1], gpu["cu_seqlens_k"][:len(seqs) + 1], max_seqlen_q, max_seqlen_k, gpu["slot_mapping"][:total_tokens], None, block_tables)
         hidden_states = self.model(gpu["input_ids"][:total_tokens], gpu["positions"][:total_tokens])
+        torch.cuda.synchronize()
+        forward_time_s = perf_counter() - forward_t0
+
+        lmhead_t0 = perf_counter()
         # Do NOT use compute_logits here because ParallelLMHead in prefill mode
         # only returns last-token logits per seq. We need logits for ALL verify tokens.
         logits = torch.nn.functional.linear(hidden_states, self.model.lm_head.weight)
+        torch.cuda.synchronize()
+        lmhead_time_s = perf_counter() - lmhead_t0
         reset_context()
 
-        # Vectorized rejection sampling
+        sampling_t0 = perf_counter()
         results = []
         offset = 0
         gamma = self.gamma
@@ -377,22 +395,17 @@ class ModelRunner:
             temperature = seq.temperature
             target_probs = torch.softmax(seq_logits.float() / temperature, dim=-1)
 
-            # Stack draft probs and get token indices
             draft_tok_ids = torch.tensor(draft_tokens[i], dtype=torch.int64, device=target_probs.device)
-            draft_probs_stacked = torch.stack(draft_probs[i])  # (num_draft, vocab)
+            draft_probs_stacked = torch.stack(draft_probs[i])
 
-            # Gather p_target and p_draft for draft tokens
             p_target = target_probs[:num_draft].gather(1, draft_tok_ids.unsqueeze(1)).squeeze(1)
             p_draft = draft_probs_stacked.gather(1, draft_tok_ids.unsqueeze(1)).squeeze(1)
 
-            # Compute acceptance probabilities and random numbers
             accept_probs = torch.clamp(p_target / p_draft.clamp(min=1e-10), max=1.0)
             rand_vals = torch.rand(num_draft, device=target_probs.device)
             accepted_mask = rand_vals < accept_probs
 
-            # Find first rejection point
             if accepted_mask.all():
-                # All accepted - take all draft tokens + bonus from last position
                 accepted_tokens = draft_tok_ids.tolist()
                 bonus_token = torch.multinomial(target_probs[num_draft], 1).item()
                 accepted_tokens.append(bonus_token)
@@ -401,7 +414,6 @@ class ModelRunner:
                 first_reject = (~accepted_mask).nonzero(as_tuple=True)[0][0].item()
                 accepted_tokens = draft_tok_ids[:first_reject].tolist()
                 draft_accepted_count = first_reject
-                # Sample from adjusted distribution at rejection point
                 adjusted = torch.clamp(target_probs[first_reject] - draft_probs_stacked[first_reject], min=0)
                 adjusted_sum = adjusted.sum()
                 if adjusted_sum > 1e-10:
@@ -412,6 +424,14 @@ class ModelRunner:
                 accepted_tokens.append(bonus_token)
 
             results.append((accepted_tokens, draft_accepted_count))
+        torch.cuda.synchronize()
+        sampling_time_s = perf_counter() - sampling_t0
+        self.last_verify_breakdown = {
+            "prep_time_s": prep_time_s,
+            "forward_time_s": forward_time_s,
+            "lmhead_time_s": lmhead_time_s,
+            "sampling_time_s": sampling_time_s,
+        }
         return results
 
     @torch.inference_mode()

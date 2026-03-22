@@ -95,6 +95,10 @@ def run_latency_benchmark(llm: LLM, prompt_token_ids: list[int], sampling_params
         "spec_accepted": stats.get("spec_accepted"),
         "spec_draft_time_ms": stats.get("spec_draft_time_s", 0.0) * 1000,
         "spec_verify_time_ms": stats.get("spec_verify_time_s", 0.0) * 1000,
+        "spec_verify_prep_time_ms": stats.get("spec_verify_prep_time_s", 0.0) * 1000,
+        "spec_verify_forward_time_ms": stats.get("spec_verify_forward_time_s", 0.0) * 1000,
+        "spec_verify_lmhead_time_ms": stats.get("spec_verify_lmhead_time_s", 0.0) * 1000,
+        "spec_verify_sampling_time_ms": stats.get("spec_verify_sampling_time_s", 0.0) * 1000,
         "spec_apply_time_ms": stats.get("spec_apply_time_s", 0.0) * 1000,
         "spec_cleanup_time_ms": stats.get("spec_cleanup_time_s", 0.0) * 1000,
         "spec_overhead_time_ms": stats.get("spec_overhead_time_s", 0.0) * 1000,
@@ -147,6 +151,23 @@ def print_comparison(baseline: dict, spec: dict):
     ]
     output_tokens = spec.get("output_tokens") or 0
     for name, key in stage_metrics:
+        value = spec.get(key)
+        if value is None:
+            print(f"{name:<30} {'n/a':>16}")
+            continue
+        per_token = value / output_tokens if output_tokens else None
+        suffix = f" ({per_token:.2f} ms/token)" if per_token is not None else ""
+        print(f"{name:<30} {value:>16.2f}{suffix}")
+
+    print("\nVerify Breakdown")
+    print("-" * 88)
+    verify_metrics = [
+        ("Tensor prep (ms)", "spec_verify_prep_time_ms"),
+        ("Model forward (ms)", "spec_verify_forward_time_ms"),
+        ("lm_head (ms)", "spec_verify_lmhead_time_ms"),
+        ("Rejection sampling (ms)", "spec_verify_sampling_time_ms"),
+    ]
+    for name, key in verify_metrics:
         value = spec.get(key)
         if value is None:
             print(f"{name:<30} {'n/a':>16}")

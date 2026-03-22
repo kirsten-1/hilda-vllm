@@ -4,6 +4,16 @@ import torch.nn.functional as F
 import torch.distributed as dist
 
 
+def _maybe_triton_verify_linear(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None,
+) -> torch.Tensor | None:
+    from mini_vllm.layers.verify_mlp_kernels import maybe_triton_verify_linear
+
+    return maybe_triton_verify_linear(x, weight, bias)
+
+
 def divide(numerator, denominator):
     assert numerator % denominator == 0
     return numerator // denominator
@@ -21,6 +31,7 @@ class LinearBase(nn.Module):
         super().__init__()
         self.tp_dim = tp_dim
         self.tp_rank = dist.get_rank()
+        self.use_verify_kernel = False
         self.tp_size = dist.get_world_size()
         self.weight = nn.Parameter(torch.empty(output_size, input_size))
         self.weight.weight_loader = self.weight_loader
@@ -48,6 +59,10 @@ class ReplicatedLinear(LinearBase):
         param.data.copy_(loaded_weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.use_verify_kernel:
+            y = _maybe_triton_verify_linear(x, self.weight, self.bias)
+            if y is not None:
+                return y
         return F.linear(x, self.weight, self.bias)
 
 
@@ -70,6 +85,10 @@ class ColumnParallelLinear(LinearBase):
         param_data.copy_(loaded_weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.use_verify_kernel:
+            y = _maybe_triton_verify_linear(x, self.weight, self.bias)
+            if y is not None:
+                return y
         return F.linear(x, self.weight, self.bias)
 
 
@@ -147,6 +166,13 @@ class RowParallelLinear(LinearBase):
         param_data.copy_(loaded_weight)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
+        if self.use_verify_kernel:
+            bias = self.bias if self.tp_rank == 0 else None
+            y = _maybe_triton_verify_linear(x, self.weight, bias)
+            if y is not None:
+                if self.tp_size > 1:
+                    dist.all_reduce(y)
+                return y
         y = F.linear(x, self.weight, self.bias if self.tp_rank == 0 else None)
         if self.tp_size > 1:
             dist.all_reduce(y)

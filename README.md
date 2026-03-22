@@ -71,6 +71,12 @@ Target: Qwen3-8B, Draft: Qwen3-0.6B, gamma=3, 8 requests.
 | Spec Decode (gamma=3) | 435 | 3.52 | 123.56 | 33.7% |
 
 > Speculative decoding is a latency optimization for low-batch scenarios (batch=1). At batch=8 the draft/verify overhead exceeds the savings from accepted tokens. The 33.7% acceptance rate reflects the vocabulary distribution gap between Qwen3-8B and Qwen3-0.6B.
+>
+> Batch=1 is the intended use case. On Qwen3-8B + Qwen3-0.6B with gamma=3 and seed=0, baseline decode measured TTFT 31.32 ms / TPOT 10.81 ms / 91.22 tok/s, while speculative decoding measured TTFT 53.51 ms / TPOT 9.14 ms / 105.41 tok/s at 65.5% acceptance.
+>
+> Performance is highly acceptance-rate sensitive. Low-acceptance prompts still regress, so speculative decoding remains experimental rather than a default production path.
+>
+> The verify-MLP Triton skinny-GEMM experiment is disabled by default. On the same 8B workload it regressed verify forward time versus the default CUTLASS/cuBLAS path.
 
 ## Commands
 
@@ -90,6 +96,12 @@ PYTHONPATH=. python benchmarks/bench_decode_heavy.py --model /root/huggingface/Q
 
 # Speculative decoding
 PYTHONPATH=. python benchmarks/bench_spec_decode.py --target-model /root/autodl-tmp/Qwen3-8B --draft-model /root/huggingface/Qwen3-0.6B --gamma 3
+
+# Batch=1 speculative decoding latency
+PYTHONPATH=. python benchmarks/bench_spec_decode_batch1.py --target-model /root/autodl-tmp --draft-model /root/huggingface/Qwen3-0.6B --gamma 3 --seed 0
+
+# Re-enable the experimental verify-MLP Triton path for kernel experiments
+MINI_VLLM_ENABLE_VERIFY_MLP_TRITON=1 PYTHONPATH=. python benchmarks/bench_spec_decode_batch1.py --target-model /root/autodl-tmp --draft-model /root/huggingface/Qwen3-0.6B --gamma 3 --seed 0
 ```
 
 ## OpenAI API Server
@@ -118,12 +130,18 @@ curl -N http://127.0.0.1:8000/v1/chat/completions \
 
 # With speculative decoding
 python -m mini_vllm.server --model /root/autodl-tmp/Qwen3-8B --spec-decode-model /root/huggingface/Qwen3-0.6B --spec-decode-gamma 3 --port 8000
+
+# Concurrent server benchmark (non-streaming)
+PYTHONPATH=. python benchmarks/bench_server_concurrent.py --url http://127.0.0.1:8000/v1/chat/completions --model Qwen3-0.6B --num-requests 32 --max-tokens 256
+
+# Concurrent server benchmark (streaming + TTFT)
+PYTHONPATH=. python benchmarks/bench_server_concurrent.py --url http://127.0.0.1:8000/v1/chat/completions --model Qwen3-0.6B --num-requests 32 --max-tokens 256 --stream --tokenizer /root/huggingface/Qwen3-0.6B
 ```
 
-`stream=true` produces OpenAI-compatible SSE with real step-level incremental chunks. The first chunk arrives after prompt prefill finishes. Each streaming request currently holds the engine exclusively.
+`stream=true` produces OpenAI-compatible SSE with real step-level incremental chunks. The first chunk arrives after prompt prefill finishes. When continuous batching is available, streamed and non-streamed requests share the same background engine loop and can be merged into the same decode steps.
 
 ## Next
 
-- Reduce streaming exclusivity so streamed requests do not monopolize the engine.
-- Batch=1 latency benchmark for speculative decoding to demonstrate the target use case.
-- Pre-allocated tensor buffers for persistent batching to close the remaining ~6.5% throughput gap.
+- Publish representative server concurrency results for both non-streaming throughput and streaming TTFT.
+- Improve speculative decoding heuristics for low-acceptance prompts instead of relying on a single fixed gamma.
+- Revisit verify forward kernels only with a new implementation that beats the default GEMM path in 8B end-to-end tests.

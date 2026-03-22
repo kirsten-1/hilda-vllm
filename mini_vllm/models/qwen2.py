@@ -7,6 +7,7 @@ from mini_vllm.layers.activation import SiluAndMul
 from mini_vllm.layers.attention import Attention
 from mini_vllm.layers.layernorm import RMSNorm
 from mini_vllm.layers.linear import QKVParallelLinear, MergedColumnParallelLinear, RowParallelLinear
+from mini_vllm.layers.verify_mlp_kernels import verify_mlp_triton_requested
 from mini_vllm.layers.rotary_embedding import get_rope
 from mini_vllm.layers.embed_head import VocabParallelEmbedding, ParallelLMHead
 
@@ -93,11 +94,13 @@ class Qwen2MLP(nn.Module):
             [intermediate_size] * 2,
             bias=False,
         )
+        self.gate_up_proj.use_verify_kernel = verify_mlp_triton_requested()
         self.down_proj = RowParallelLinear(
             intermediate_size,
             hidden_size,
             bias=False,
         )
+        self.down_proj.use_verify_kernel = verify_mlp_triton_requested()
         assert hidden_act == "silu"
         self.act_fn = SiluAndMul()
 

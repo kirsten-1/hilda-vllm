@@ -1,0 +1,54 @@
+{
+  "target_model": "/root/autodl-tmp",
+  "draft_model": "/root/huggingface/Qwen3-0.6B",
+  "gamma": 3,
+  "verify_batch_size": 1,
+  "verify_tokens": 4,
+  "hidden_size": 4096,
+  "dtype": "torch.bfloat16",
+  "num_layers": 36,
+  "kernel_repo": "/root/hilda-kernel/triton-kernels",
+  "verify_mlp_triton_context": true,
+  "results_ms": {
+    "qkv_proj": {
+      "mean_ms": 0.036502061411738396,
+      "min_ms": 0.03437697887420654,
+      "max_ms": 0.04595285281538963
+    },
+    "o_proj": {
+      "mean_ms": 0.035981545224785805,
+      "min_ms": 0.0338179524987936,
+      "max_ms": 0.07235794328153133
+    },
+    "gate_up_proj": {
+      "mean_ms": 0.14105374924838543,
+      "min_ms": 0.13902690261602402,
+      "max_ms": 0.15110988169908524
+    },
+    "silu_and_mul": {
+      "mean_ms": 0.033902558498084545,
+      "min_ms": 0.032303156331181526,
+      "max_ms": 0.038531841710209846
+    },
+    "down_proj": {
+      "mean_ms": 0.08536561392247677,
+      "min_ms": 0.08344301022589207,
+      "max_ms": 0.09397696703672409
+    },
+    "mlp_end_to_end": {
+      "mean_ms": 0.23055707570165396,
+      "min_ms": 0.22642803378403187,
+      "max_ms": 0.24037412367761135
+    },
+    "hilda_swiglu": {
+      "mean_ms": 0.10700431652367115,
+      "min_ms": 0.10085408575832844,
+      "max_ms": 0.1503019593656063
+    }
+  },
+  "derived": {
+    "mlp_linear_only_ms": 0.2264193631708622,
+    "mlp_activation_share_pct": 14.704627214284768,
+    "attn_projection_ms": 0.0724836066365242
+  }
+}

@@ -485,14 +485,15 @@ class ModelRunner:
                 slot_mapping,
             )
 
+    @torch.inference_mode()
     def allocate_decode_runtime_buffers(self):
         max_bs = self.config.max_num_seqs
         self.decode_cpu_staging = dict(
-            input_ids=torch.empty(max_bs, dtype=torch.int64, pin_memory=True),
-            positions=torch.empty(max_bs, dtype=torch.int64, pin_memory=True),
-            slot_mapping=torch.empty(max_bs, dtype=torch.int32, pin_memory=True),
-            context_lens=torch.empty(max_bs, dtype=torch.int32, pin_memory=True),
-            block_table_row=torch.empty(self.max_num_decode_blocks, dtype=torch.int32, pin_memory=True),
+            input_ids=torch.empty(max_bs, dtype=torch.int64, device="cpu", pin_memory=True),
+            positions=torch.empty(max_bs, dtype=torch.int64, device="cpu", pin_memory=True),
+            slot_mapping=torch.empty(max_bs, dtype=torch.int32, device="cpu", pin_memory=True),
+            context_lens=torch.empty(max_bs, dtype=torch.int32, device="cpu", pin_memory=True),
+            block_table_row=torch.empty(self.max_num_decode_blocks, dtype=torch.int32, device="cpu", pin_memory=True),
         )
         self.decode_slot_seq_ids = [-1] * max_bs
         self.decode_slot_block_table_lens = [0] * max_bs
@@ -600,6 +601,7 @@ class ModelRunner:
         set_context(True, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, slot_mapping, None, block_tables)
         return input_ids, positions
 
+    @torch.inference_mode()
     def prepare_decode(self, scheduled_seqs: list[ScheduledSequence]):
         bs = len(scheduled_seqs)
         graph_bs = self._decode_graph_batch_size(bs)

@@ -1,13 +1,15 @@
 import torch
 from torch import nn
 
+from mini_vllm.utils.compile import safe_compile
+
 
 class Sampler(nn.Module):
 
     def __init__(self):
         super().__init__()
 
-    @torch.compile
+    @safe_compile
     def forward(
         self,
         logits: torch.Tensor,

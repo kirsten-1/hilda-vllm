@@ -17,9 +17,20 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), ".."))
 from mini_vllm import LLM, SamplingParams
 
 
+def default_target_model() -> str:
+    candidates = [
+        "/root/autodl-tmp/Qwen3-8B",
+        "/root/autodl-tmp",
+    ]
+    for candidate in candidates:
+        if os.path.isdir(candidate):
+            return candidate
+    return candidates[0]
+
+
 def parse_args():
     parser = argparse.ArgumentParser(description="Batch=1 speculative decoding latency benchmark")
-    parser.add_argument("--target-model", default="/root/autodl-tmp")
+    parser.add_argument("--target-model", default=default_target_model())
     parser.add_argument("--draft-model", default="/root/huggingface/Qwen3-0.6B")
     parser.add_argument("--gamma", type=int, default=3)
     parser.add_argument("--prompt-len", type=int, default=256)
@@ -114,6 +125,8 @@ def print_comparison(baseline: dict, spec: dict):
 
 def main():
     args = parse_args()
+    print(f"Resolved target model path: {args.target_model}")
+    print(f"Resolved draft model path: {args.draft_model}")
     prompt_token_ids = build_prompt(args.prompt_len, args.seed)
     sampling_params = SamplingParams(temperature=0.6, ignore_eos=True, max_tokens=args.max_output_len)
 

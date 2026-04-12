@@ -23,6 +23,10 @@ def parse_args():
     parser.add_argument("--engine-name", default=None)
     parser.add_argument("--output-dir", default="benchmarks/results")
     parser.add_argument("--kv-cache-dtype", choices=("auto", "fp8"), default="auto")
+    parser.add_argument("--num-seqs", type=int, default=256)
+    parser.add_argument("--prompt-len", type=int, default=100)
+    parser.add_argument("--prompt-len-max", type=int, default=None)
+    parser.add_argument("--output-len", type=int, default=1024)
     return parser.parse_args()
 
 
@@ -165,9 +169,12 @@ def build_result(args, llm, outputs, prompt_token_ids, total_time_s: float):
 def main():
     args = parse_args()
     seed(0)
-    num_seqs = 512
-    max_input_len = 1024
-    max_ouput_len = 1024
+    num_seqs = args.num_seqs
+    prompt_len = args.prompt_len
+    prompt_len_max = args.prompt_len_max if args.prompt_len_max is not None else prompt_len
+    output_len = args.output_len
+    if prompt_len_max < prompt_len:
+        raise ValueError("--prompt-len-max must be greater than or equal to --prompt-len")
 
     LLM, SamplingParams = load_backend(args.backend)
     path = os.path.expanduser(args.model)
@@ -176,8 +183,14 @@ def main():
         llm_kwargs["kv_cache_dtype"] = args.kv_cache_dtype
     llm = LLM(path, **llm_kwargs)
 
-    prompt_token_ids = [[randint(0, 10000) for _ in range(randint(100, max_input_len))] for _ in range(num_seqs)]
-    sampling_params = [SamplingParams(temperature=0.6, ignore_eos=True, max_tokens=randint(100, max_ouput_len)) for _ in range(num_seqs)]
+    prompt_token_ids = [
+        [randint(0, 10000) for _ in range(randint(prompt_len, prompt_len_max))]
+        for _ in range(num_seqs)
+    ]
+    sampling_params = [
+        SamplingParams(temperature=0.6, ignore_eos=True, max_tokens=output_len)
+        for _ in range(num_seqs)
+    ]
 
     llm.generate(["Benchmark: "], SamplingParams())
     prompts = prepare_prompts(prompt_token_ids, args.backend)

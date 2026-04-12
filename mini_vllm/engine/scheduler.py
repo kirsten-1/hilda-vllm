@@ -1,4 +1,5 @@
 import heapq
+import os
 from collections import deque
 from dataclasses import dataclass, field
 
@@ -46,6 +47,7 @@ class Scheduler:
         self.decode_slots: list[Sequence | None] = [None] * self.max_num_seqs
         self.free_slot_indices: list[int] = list(range(self.max_num_seqs))
         self.persistent_batch_size: int = 0
+        self.debug_persistent_batching = os.getenv("HILDA_DEBUG_PB", "0") == "1"
 
     def is_finished(self):
         return not self.waiting and not self.running
@@ -218,6 +220,14 @@ class Scheduler:
         if prefer_decode:
             scheduled = self._schedule_decode()
             if scheduled:
+                if self.debug_persistent_batching:
+                    active_slots = sum(slot is not None for slot in self.decode_slots[:self.persistent_batch_size])
+                    print(
+                        "[PB] schedule decode(preferred): "
+                        f"running={len(self.running)} waiting={len(self.waiting)} "
+                        f"persistent_batch_size={self.persistent_batch_size} "
+                        f"active_slots={active_slots} scheduled={len(scheduled)}"
+                    )
                 self.last_step_was_prefill = False
                 return scheduled, False
         scheduled = self._schedule_prefill()
@@ -226,6 +236,14 @@ class Scheduler:
             return scheduled, True
         scheduled = self._schedule_decode()
         assert scheduled
+        if self.debug_persistent_batching:
+            active_slots = sum(slot is not None for slot in self.decode_slots[:self.persistent_batch_size])
+            print(
+                "[PB] schedule decode(fallback): "
+                f"running={len(self.running)} waiting={len(self.waiting)} "
+                f"persistent_batch_size={self.persistent_batch_size} "
+                f"active_slots={active_slots} scheduled={len(scheduled)}"
+            )
         self.last_step_was_prefill = False
         return scheduled, False
 

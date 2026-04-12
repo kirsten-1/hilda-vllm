@@ -36,6 +36,7 @@ class ModelRunner:
         self.event = event
         self.use_fp8_kv_cache = config.kv_cache_dtype == "fp8"
         self.use_spec_decode = bool(config.spec_decode_model)
+        self.debug_persistent_batching = os.getenv("HILDA_DEBUG_PB", "0") == "1"
         self.gamma = config.spec_decode_gamma
         self.last_verify_breakdown = {
             "prep_time_s": 0.0,
@@ -681,6 +682,14 @@ class ModelRunner:
             cpu["context_lens"][i] = context_len
             cpu["slot_mapping"][i] = seq.block_table[-1] * self.block_size + seq.last_block_num_tokens - 1
             self._sync_decode_block_table_row(slot_idx, seq)
+
+        if self.debug_persistent_batching:
+            active_seqs = sum(0 if scheduled_seq.is_padding else 1 for scheduled_seq in scheduled_seqs)
+            print(
+                "[PB] prepare_decode: "
+                f"bs={bs} graph_bs={graph_bs} active_seqs={active_seqs} "
+                f"padded_slots={bs - active_seqs}"
+            )
 
         gpu["input_ids"][:bs].copy_(cpu["input_ids"][:bs], non_blocking=True)
         gpu["positions"][:bs].copy_(cpu["positions"][:bs], non_blocking=True)

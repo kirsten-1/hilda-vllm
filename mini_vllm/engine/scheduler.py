@@ -56,19 +56,38 @@ class Scheduler:
     # --- Slot management ---
 
     def _assign_decode_slot(self, seq: Sequence):
+        #  从空闲 slot 列表弹出一个索引（最小堆）
         slot_idx = heapq.heappop(self.free_slot_indices)
+        # 在 decode_slots 中放入请求
         self.decode_slots[slot_idx] = seq
+        # 记录请求的 slot 索引
         seq.decode_slot_index = slot_idx
+        #  persistent_batch_size 直接决定 GPU kernel 的计算范围。
+        # batch size是一个“最高的水位”
         if slot_idx + 1 > self.persistent_batch_size:
             self.persistent_batch_size = slot_idx + 1
+#   举个具体例子：
 
+#   decode_slots = [SeqA, None, SeqC, None, SeqE]
+#                    0      1     2     3     4
+
+#   - 有效 slot 数量 = 3
+#   - 但 kernel 必须处理 index 0~4，因为 SeqE 在 index 4
+
+#   如果你把 batch dimension 设成 3（有效数量），kernel 只处理 [0, 1, 2]，SeqE 就被漏掉了。
+# 所以必须设成 5（最高水位 = 4 + 1）。
+# kernel 内部遇到 None slot 跳过就行，但range 必须覆盖所有有效 slot。
+
+    # 把尾部的序列搬到中间的空洞处，使尾部变空，从而让 _maybe_shrink_batch 能收缩水位线
     def _free_decode_slot(self, seq: Sequence):
         slot_idx = seq.decode_slot_index
         if slot_idx >= 0:
             last_idx = self.persistent_batch_size - 1
+            # while：找到最后一个非空 slot
             while last_idx > slot_idx and self.decode_slots[last_idx] is None:
                 last_idx -= 1
             if last_idx > slot_idx:
+                # 把尾部的请求搬到被释放的位置，填补空洞
                 moved_seq = self.decode_slots[last_idx]
                 assert moved_seq is not None
                 self.decode_slots[slot_idx] = moved_seq
@@ -81,8 +100,10 @@ class Scheduler:
             seq.decode_slot_index = -1
 
     def _maybe_shrink_batch(self):
+        # 最后都是None,那么“最高水位”收缩
         while self.persistent_batch_size > 0 and self.decode_slots[self.persistent_batch_size - 1] is None:
             self.persistent_batch_size -= 1
+        # 如果没有 running 请求，重置所有 slots
         if not self.running:
             assert all(slot is None for slot in self.decode_slots)
             self.persistent_batch_size = 0
@@ -119,10 +140,11 @@ class Scheduler:
     def _schedule_prefill(self) -> list[ScheduledSequence]:
         scheduled_seqs = []
         num_seqs = 0
+        active_seqs = len(self.running)
         num_batched_tokens = 0
         chunk_limit = self._compute_chunk_limit()
         for seq in self.waiting:
-            if num_seqs >= self.max_num_seqs:
+            if active_seqs + num_seqs >= self.max_num_seqs:
                 break
             if not seq.block_table:
                 if not self.block_manager.can_allocate(seq):
@@ -152,6 +174,11 @@ class Scheduler:
             seq = self.decode_slots[i]
             if seq is None:
                 # Padding slot
+                scheduled_seqs.append(ScheduledSequence(None, 0, slot_index=i))
+                continue
+            if not seq.block_table:
+                # Keep decode slots self-healing under high churn.
+                self.preempt(seq)
                 scheduled_seqs.append(ScheduledSequence(None, 0, slot_index=i))
                 continue
             # Check block availability

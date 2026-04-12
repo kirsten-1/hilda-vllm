@@ -100,3 +100,21 @@ def test_decode_runs_between_prefill_chunks_when_running_queue_is_non_empty():
     assert first_is_prefill is True
     assert second_is_prefill is False
     assert second_scheduled[0].seq is decode_seq
+
+
+def test_prefill_respects_running_sequences_when_counting_max_num_seqs():
+    scheduler = Scheduler(make_config(max_num_seqs=2, max_num_batched_tokens=8))
+    running_seq = Sequence([1, 2], SamplingParams(max_tokens=4))
+    scheduler.add(running_seq)
+    scheduled, is_prefill = scheduler.schedule()
+    scheduler.postprocess(scheduled, [42], is_prefill)
+
+    waiting_seq_1 = Sequence([10, 11], SamplingParams(max_tokens=4))
+    waiting_seq_2 = Sequence([20, 21], SamplingParams(max_tokens=4))
+    scheduler.add(waiting_seq_1)
+    scheduler.add(waiting_seq_2)
+
+    next_scheduled, next_is_prefill = scheduler.schedule()
+
+    assert next_is_prefill is True
+    assert [scheduled_seq.seq for scheduled_seq in next_scheduled] == [waiting_seq_1]

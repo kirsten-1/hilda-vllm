@@ -667,6 +667,14 @@ class ModelRunner:
                 continue
 
             seq = scheduled_seq.seq
+            if not seq.block_table:
+                raise RuntimeError(
+                    "decode sequence has empty block_table: "
+                    f"seq_id={seq.seq_id}, status={seq.status}, "
+                    f"num_tokens={seq.num_tokens}, "
+                    f"num_computed_tokens={seq.num_computed_tokens}, "
+                    f"slot_index={slot_idx}"
+                )
             context_len = len(seq)
             cpu["input_ids"][i] = seq.last_token
             cpu["positions"][i] = context_len - 1

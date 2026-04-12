@@ -16,7 +16,7 @@ from mini_vllm.models.qwen3 import Qwen3ForCausalLM
 from mini_vllm.models.qwen2 import Qwen2ForCausalLM
 from mini_vllm.utils.context import get_context, reset_context, set_context
 from mini_vllm.utils.loader import load_model
-
+from mini_vllm.engine.sequence import Sequence, SequenceStatus
 MODEL_REGISTRY = {
     "qwen3": Qwen3ForCausalLM,
     "qwen2": Qwen2ForCausalLM,
@@ -668,6 +668,10 @@ class ModelRunner:
                 continue
 
             seq = scheduled_seq.seq
+            if seq.status == SequenceStatus.WAITING:
+                # 跳过 WAITING 状态的请求（可能有 bug 导致它在 decode_slots 里）
+                self._clear_decode_block_table_slot(slot_idx)
+                continue
             if not seq.block_table:
                 raise RuntimeError(
                     "decode sequence has empty block_table: "

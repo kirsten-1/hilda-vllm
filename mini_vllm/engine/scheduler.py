@@ -235,7 +235,9 @@ class Scheduler:
             self.last_step_was_prefill = True
             return scheduled, True
         scheduled = self._schedule_decode()
-        assert scheduled
+        # assert scheduled
+        if not scheduled:
+            return [], False  # 没有可调度的请求
         if self.debug_persistent_batching:
             active_slots = sum(slot is not None for slot in self.decode_slots[:self.persistent_batch_size])
             print(

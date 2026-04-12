@@ -56,6 +56,8 @@ class LLMEngine:
 
     def step(self):
         seqs, is_prefill = self.scheduler.schedule()
+        if not seqs:  # ← 添加这个检查
+            return [], False, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0  # ← 返回空 tuple
         token_ids = self.model_runner.call("run", seqs, is_prefill)
         self.scheduler.postprocess(seqs, token_ids, is_prefill)
         if is_prefill and self.config.kv_cache_dtype == "fp8":

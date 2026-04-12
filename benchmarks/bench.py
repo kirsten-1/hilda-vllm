@@ -144,7 +144,7 @@ def build_result(args, llm, outputs, prompt_token_ids, total_time_s: float):
 def main():
     args = parse_args()
     seed(0)
-    num_seqs = 256
+    num_seqs = 512
     max_input_len = 1024
     max_ouput_len = 1024
 

@@ -48,6 +48,7 @@ class Scheduler:
         self.free_slot_indices: list[int] = list(range(self.max_num_seqs))
         self.persistent_batch_size: int = 0
         self.debug_persistent_batching = os.getenv("HILDA_DEBUG_PB", "0") == "1"
+        self.debug_prefill = os.getenv("HILDA_DEBUG_PREFILL", "0") == "1"
 
     def is_finished(self):
         return not self.waiting and not self.running
@@ -145,24 +146,45 @@ class Scheduler:
         active_seqs = len(self.running)
         num_batched_tokens = 0
         chunk_limit = self._compute_chunk_limit()
-        for seq in self.waiting:
+        for seq in list(self.waiting):
             if active_seqs + num_seqs >= self.max_num_seqs:
                 break
             if not seq.block_table:
                 if not self.block_manager.can_allocate(seq):
+                    if self.debug_prefill:
+                        print(
+                            "[PREFILL] blocked on allocation: "
+                            f"seq_id={seq.seq_id} len={len(seq)} "
+                            f"free_blocks={len(self.block_manager.free_block_ids)} "
+                            f"required_blocks={seq.num_blocks}"
+                        )
                     break
                 self.block_manager.allocate(seq)
                 seq.num_computed_tokens = seq.num_cached_tokens
             remaining_tokens = seq.num_uncomputed_tokens
             if remaining_tokens <= 0:
-                break
+                if self.debug_prefill:
+                    print(
+                        "[PREFILL] rotating anomalous seq with no remaining tokens: "
+                        f"seq_id={seq.seq_id} len={len(seq)} "
+                        f"num_computed_tokens={seq.num_computed_tokens}"
+                    )
+                self._append_waiting(seq)
+                continue
             available_tokens = min(chunk_limit, self.max_num_batched_tokens - num_batched_tokens)
             if available_tokens <= 0:
                 break
             chunk_size = min(remaining_tokens, available_tokens)
             chunk_size = self._align_chunk_size(chunk_size, remaining_tokens)
             if chunk_size <= 0:
-                break
+                if self.debug_prefill:
+                    print(
+                        "[PREFILL] rotating anomalous seq with non-positive chunk: "
+                        f"seq_id={seq.seq_id} remaining_tokens={remaining_tokens} "
+                        f"available_tokens={available_tokens} chunk_limit={chunk_limit}"
+                    )
+                self._append_waiting(seq)
+                continue
             num_seqs += 1
             num_batched_tokens += chunk_size
             scheduled_seqs.append(ScheduledSequence(seq, chunk_size))
@@ -236,6 +258,16 @@ class Scheduler:
         if scheduled:
             self.last_step_was_prefill = True
             return scheduled, True
+        if self.debug_prefill and self.waiting:
+            head = self.waiting[0]
+            print(
+                "[PREFILL] no schedulable prefill work: "
+                f"waiting={len(self.waiting)} running={len(self.running)} "
+                f"persistent_batch_size={self.persistent_batch_size} "
+                f"head_seq_id={head.seq_id} head_len={len(head)} "
+                f"head_num_computed_tokens={head.num_computed_tokens} "
+                f"head_blocks={len(head.block_table)}"
+            )
         scheduled = self._schedule_decode()
         if not scheduled:
             raise RuntimeError(

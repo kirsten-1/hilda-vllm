@@ -172,6 +172,7 @@ class Scheduler:
         if self.persistent_batch_size == 0:
             return []
         scheduled_seqs = []
+        has_real_seq = False
         for i in range(self.persistent_batch_size):
             seq = self.decode_slots[i]
             if seq is None:
@@ -196,7 +197,8 @@ class Scheduler:
                     continue
             self.block_manager.may_append(seq)
             scheduled_seqs.append(ScheduledSequence(seq, 1, slot_index=i))
-        return scheduled_seqs
+            has_real_seq = True
+        return scheduled_seqs if has_real_seq else []
 
     def _find_preempt_victim(self, exclude: Sequence | None = None) -> Sequence | None:
         """Find a running seq to preempt (longest first), excluding the given seq."""
@@ -235,9 +237,12 @@ class Scheduler:
             self.last_step_was_prefill = True
             return scheduled, True
         scheduled = self._schedule_decode()
-        # assert scheduled
         if not scheduled:
-            return [], False  # 没有可调度的请求
+            raise RuntimeError(
+                "scheduler found no runnable prefill or decode work: "
+                f"running={len(self.running)} waiting={len(self.waiting)} "
+                f"persistent_batch_size={self.persistent_batch_size}"
+            )
         if self.debug_persistent_batching:
             active_slots = sum(slot is not None for slot in self.decode_slots[:self.persistent_batch_size])
             print(

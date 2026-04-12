@@ -18,16 +18,40 @@ A minimal high-performance LLM inference engine built from scratch, inspired by 
 
 Benchmark device: NVIDIA GeForce RTX 5090 (Blackwell), `torch 2.10.0+cu128`.
 
-Model: Qwen3-0.6B, 256 requests, random prompts (50-512 tokens), max output 1024 tokens.
+Model: Qwen3-0.6B, 256 requests.
 
-| Inference Engine | Output Tokens | Time (s) | Throughput (tok/s) |
-| --- | ---: | ---: | ---: |
-| vllm | 133,966 | 12.79 | 10,474 |
-| nano-vllm | 133,966 | 13.75 | 9,741 |
-| hilda-vllm | 133,966 | 12.98 | 10,318 |
-| hilda-vllm + persistent batching | 133,966 | 14.21 | 9,425 |
+Stable decode-heavy workload: fixed prompt length 64, fixed output length 1024.
 
-> Persistent batching adds overhead from padded slot management. Pre-allocated GPU buffers and GPU-resident block tables recover most of the gap — the continuous batching server path reaches 10,339 tok/s at 32 concurrent requests (see Server Benchmark below).
+| Inference Engine | Prompt Tokens | Output Tokens | Time (s) | Total Throughput (tok/s) |
+| --- | ---: | ---: | ---: | ---: |
+| hilda-vllm | 16,384 | 262,144 | 20.37 | 12,871 |
+
+Diagnostics for this workload:
+
+- Avg decode active batch size: 195.24 / 256
+- Avg decode graph batch size: 199.07
+- Avg decode padded slots: 0.05
+- Prefill allocation blocked steps: 318
+- Min free KV blocks observed: 0 / 950
+
+Long-decode KV-pressure workload: prompt length 32-128, fixed output length 512.
+
+| Inference Engine | Prompt Tokens | Output Tokens | Time (s) | Total Throughput (tok/s) |
+| --- | ---: | ---: | ---: | ---: |
+| hilda-vllm | 19,684 | 131,072 | 7.68 | 17,056 |
+
+Diagnostics for this workload:
+
+- Avg decode active batch size: 256.00 / 256
+- Avg decode graph batch size: 256.00
+- Avg decode padded slots: 0.00
+- Prefill allocation blocked steps: 0
+- Min free KV blocks observed: 182 / 950
+
+These two workloads separate the main throughput regimes more clearly than the old mixed random-length benchmark:
+
+- In the stable decode-heavy case, throughput is limited mostly by how long the scheduler can keep a large decode batch active before KV pressure appears.
+- In the shorter-output case, the engine sustains a full 256-way decode batch with no padding waste and no KV starvation, exposing the upside of persistent batching much more clearly.
 
 ## FP8 KV Cache
 
@@ -93,9 +117,12 @@ Target: Qwen3-8B, Draft: Qwen3-0.6B, gamma=3, 8 requests.
 
 ```bash
 # Main throughput benchmark
-PYTHONPATH=. python benchmarks/bench.py --backend vllm --model /root/huggingface/Qwen3-0.6B --engine-name vllm
-PYTHONPATH=. python benchmarks/bench.py --backend nano-vllm --model /root/huggingface/Qwen3-0.6B --engine-name nano-vllm
-PYTHONPATH=. python benchmarks/bench.py --backend hilda-vllm --model /root/huggingface/Qwen3-0.6B --engine-name hilda-vllm
+PYTHONPATH=. python benchmarks/bench.py --backend vllm --model /root/huggingface/Qwen3-0.6B --engine-name vllm --num-seqs 256 --prompt-len 64 --output-len 1024
+PYTHONPATH=. python benchmarks/bench.py --backend nano-vllm --model /root/huggingface/Qwen3-0.6B --engine-name nano-vllm --num-seqs 256 --prompt-len 64 --output-len 1024
+PYTHONPATH=. python benchmarks/bench.py --backend hilda-vllm --model /root/huggingface/Qwen3-0.6B --engine-name hilda-vllm --num-seqs 256 --prompt-len 64 --output-len 1024
+
+# Short-prompt decode-heavy throughput
+PYTHONPATH=. python benchmarks/bench.py --backend hilda-vllm --model /root/huggingface/Qwen3-0.6B --engine-name hilda-vllm-short --num-seqs 256 --prompt-len 32 --prompt-len-max 128 --output-len 512
 
 # Decode jitter
 PYTHONPATH=. python benchmarks/bench_decode_jitter.py --model /root/huggingface/Qwen3-0.6B --engine-name hilda-vllm

@@ -35,6 +35,7 @@ class LLMEngine:
         config.eos = self.tokenizer.eos_token_id
         self.scheduler = Scheduler(config)
         self.last_generate_stats = None
+        self.last_step_diagnostics = None
         self._adaptive_gamma = config.spec_decode_gamma
         self._gamma_window = []
         atexit.register(self.exit)
@@ -59,6 +60,11 @@ class LLMEngine:
         if not seqs:  # ← 添加这个检查
             return [], False, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0  # ← 返回空 tuple
         token_ids = self.model_runner.call("run", seqs, is_prefill)
+        self.last_step_diagnostics = {
+            "running": len(self.scheduler.running),
+            "waiting": len(self.scheduler.waiting),
+            "decode_batch": None if is_prefill else (self.model_runner.last_decode_batch_info or {}),
+        }
         self.scheduler.postprocess(seqs, token_ids, is_prefill)
         if is_prefill and self.config.kv_cache_dtype == "fp8":
             ready_for_decode = [
@@ -229,6 +235,7 @@ class LLMEngine:
         prompts: list[str] | list[list[int]],
         sampling_params: SamplingParams | list[SamplingParams],
     ):
+        self.scheduler.reset_diagnostics()
         seqs = self._add_sequences(prompts, sampling_params)
         emitted_completion_tokens = {seq.seq_id: 0 for seq in seqs}
         request_indices = {seq.seq_id: index for index, seq in enumerate(seqs)}
@@ -253,6 +260,7 @@ class LLMEngine:
                 verify_sampling_time_s,
                 apply_time_s,
                 cleanup_time_s,
+                self.last_step_diagnostics,
             )
             for seq in seqs:
                 completion_token_ids = seq.completion_token_ids
@@ -277,6 +285,7 @@ class LLMEngine:
         sampling_params: SamplingParams | list[SamplingParams],
         use_tqdm: bool = True,
     ) -> list[str]:
+        self.scheduler.reset_diagnostics()
         if use_tqdm:
             pbar = tqdm(total=len(prompts), desc="Generating", dynamic_ncols=True)
         seqs = self._add_sequences(prompts, sampling_params)
@@ -302,6 +311,7 @@ class LLMEngine:
                 verify_sampling_time_s,
                 apply_time_s,
                 cleanup_time_s,
+                self.last_step_diagnostics,
             )
             if use_tqdm:
                 pbar.set_postfix({
@@ -351,6 +361,14 @@ class LLMEngine:
             "spec_verify_sampling_time_s": 0.0,
             "spec_apply_time_s": 0.0,
             "spec_cleanup_time_s": 0.0,
+            "decode_steps": 0,
+            "decode_scheduled_bs_sum": 0,
+            "decode_active_bs_sum": 0,
+            "decode_graph_bs_sum": 0,
+            "decode_padded_slots_sum": 0,
+            "decode_active_bs_max": 0,
+            "running_max": 0,
+            "waiting_max": 0,
         }
 
     @staticmethod
@@ -369,6 +387,7 @@ class LLMEngine:
         spec_verify_sampling_time_s: float = 0.0,
         spec_apply_time_s: float = 0.0,
         spec_cleanup_time_s: float = 0.0,
+        step_diagnostics: dict | None = None,
     ) -> tuple[float, float]:
         prefill_throughput = 0.0
         decode_throughput = 0.0
@@ -390,6 +409,18 @@ class LLMEngine:
         stats["spec_verify_sampling_time_s"] += spec_verify_sampling_time_s
         stats["spec_apply_time_s"] += spec_apply_time_s
         stats["spec_cleanup_time_s"] += spec_cleanup_time_s
+        if step_diagnostics:
+            stats["running_max"] = max(stats["running_max"], step_diagnostics.get("running", 0))
+            stats["waiting_max"] = max(stats["waiting_max"], step_diagnostics.get("waiting", 0))
+            decode_batch = step_diagnostics.get("decode_batch")
+            if decode_batch is not None:
+                active_bs = decode_batch.get("active_seqs", 0)
+                stats["decode_steps"] += 1
+                stats["decode_scheduled_bs_sum"] += decode_batch.get("scheduled_bs", 0)
+                stats["decode_active_bs_sum"] += active_bs
+                stats["decode_graph_bs_sum"] += decode_batch.get("graph_bs", 0)
+                stats["decode_padded_slots_sum"] += decode_batch.get("padded_slots", 0)
+                stats["decode_active_bs_max"] = max(stats["decode_active_bs_max"], active_bs)
         return prefill_throughput, decode_throughput
 
     def _set_last_generate_stats(self, stats: dict, total_time: float):
@@ -425,3 +456,15 @@ class LLMEngine:
             "spec_cleanup_time_s": stats["spec_cleanup_time_s"],
             "spec_overhead_time_s": spec_overhead_time_s,
         }
+        decode_steps = stats["decode_steps"]
+        self.last_generate_stats.update({
+            "decode_steps": decode_steps,
+            "avg_decode_scheduled_bs": stats["decode_scheduled_bs_sum"] / decode_steps if decode_steps else 0.0,
+            "avg_decode_active_bs": stats["decode_active_bs_sum"] / decode_steps if decode_steps else 0.0,
+            "avg_decode_graph_bs": stats["decode_graph_bs_sum"] / decode_steps if decode_steps else 0.0,
+            "avg_decode_padded_slots": stats["decode_padded_slots_sum"] / decode_steps if decode_steps else 0.0,
+            "decode_active_bs_max": stats["decode_active_bs_max"],
+            "running_max": stats["running_max"],
+            "waiting_max": stats["waiting_max"],
+        })
+        self.last_generate_stats.update(self.scheduler.get_diagnostics())

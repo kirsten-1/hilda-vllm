@@ -65,6 +65,27 @@ def print_summary(result: dict):
     print(render(["-" * width for width in widths]))
     print(render(row))
 
+    diagnostic_items = [
+        ("Avg Decode Active BS", "avg_decode_active_bs"),
+        ("Avg Decode Graph BS", "avg_decode_graph_bs"),
+        ("Avg Decode Padded Slots", "avg_decode_padded_slots"),
+        ("Decode Steps", "decode_steps"),
+        ("Max Decode Active BS", "decode_active_bs_max"),
+        ("Max Running", "running_max"),
+        ("Max Waiting", "waiting_max"),
+        ("Prefill Alloc Blocked", "prefill_allocation_blocked_steps"),
+        ("Prefill No Work", "prefill_no_schedulable_steps"),
+        ("Min Free KV Blocks", "min_free_blocks_observed"),
+        ("KV Used Blocks", "kv_used_blocks"),
+        ("KV Total Blocks", "kv_num_blocks"),
+    ]
+    available_items = [(label, key) for label, key in diagnostic_items if key in result]
+    if available_items:
+        print("\nDiagnostics:")
+        label_width = max(len(label) for label, _ in available_items)
+        for label, key in available_items:
+            print(f"{label.ljust(label_width)} : {format_metric(result[key])}")
+
 
 def save_results(result: dict, output_dir: Path):
     output_dir.mkdir(parents=True, exist_ok=True)

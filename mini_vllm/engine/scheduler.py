@@ -49,9 +49,25 @@ class Scheduler:
         self.persistent_batch_size: int = 0
         self.debug_persistent_batching = os.getenv("HILDA_DEBUG_PB", "0") == "1"
         self.debug_prefill = os.getenv("HILDA_DEBUG_PREFILL", "0") == "1"
+        self.reset_diagnostics()
 
     def is_finished(self):
         return not self.waiting and not self.running
+
+    def reset_diagnostics(self):
+        self.prefill_allocation_blocked_steps = 0
+        self.prefill_no_schedulable_steps = 0
+        self.min_free_blocks_observed = len(self.block_manager.free_block_ids)
+
+    def get_diagnostics(self):
+        return {
+            "prefill_allocation_blocked_steps": self.prefill_allocation_blocked_steps,
+            "prefill_no_schedulable_steps": self.prefill_no_schedulable_steps,
+            "min_free_blocks_observed": self.min_free_blocks_observed,
+            "kv_num_blocks": len(self.block_manager.blocks),
+            "kv_free_blocks": len(self.block_manager.free_block_ids),
+            "kv_used_blocks": len(self.block_manager.used_block_ids),
+        }
 
     def add(self, seq: Sequence):
         self.waiting.append(seq)
@@ -146,11 +162,16 @@ class Scheduler:
         active_seqs = len(self.running)
         num_batched_tokens = 0
         chunk_limit = self._compute_chunk_limit()
+        self.min_free_blocks_observed = min(
+            self.min_free_blocks_observed,
+            len(self.block_manager.free_block_ids),
+        )
         for seq in list(self.waiting):
             if active_seqs + num_seqs >= self.max_num_seqs:
                 break
             if not seq.block_table:
                 if not self.block_manager.can_allocate(seq):
+                    self.prefill_allocation_blocked_steps += 1
                     if self.debug_prefill:
                         print(
                             "[PREFILL] blocked on allocation: "
@@ -259,6 +280,7 @@ class Scheduler:
             self.last_step_was_prefill = True
             return scheduled, True
         if self.debug_prefill and self.waiting:
+            self.prefill_no_schedulable_steps += 1
             head = self.waiting[0]
             print(
                 "[PREFILL] no schedulable prefill work: "
@@ -268,6 +290,8 @@ class Scheduler:
                 f"head_num_computed_tokens={head.num_computed_tokens} "
                 f"head_blocks={len(head.block_table)}"
             )
+        elif self.waiting:
+            self.prefill_no_schedulable_steps += 1
         scheduled = self._schedule_decode()
         if not scheduled:
             raise RuntimeError(
